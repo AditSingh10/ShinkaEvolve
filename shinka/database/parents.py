@@ -234,6 +234,88 @@ class PowerLawSamplingStrategy(ParentSamplingStrategy):
         return None
 
 
+# === ALG2 MOD (aux-selection): sample a parent from one aux's distribution. ===
+class AuxSamplingStrategy(ParentSamplingStrategy):
+    """Draw a parent using an auxiliary structural signal instead of the oracle.
+
+    Same candidate pool and same weighting math as the oracle sampler (sigmoid of a
+    median/MAD-standardized score x 1/(1+children)), but the score is the aux, oriented
+    by its direction prior and -- by default -- residualized against the oracle so the
+    arm does not merely re-pick the oracle's own parents.
+
+    Stateless by construction (async sampling uses read-only thread-local DBs). Returns
+    None if it cannot sample, so the caller can fall back to the oracle strategy.
+    """
+
+    def __init__(self, cursor, conn, config, get_program_func,
+                 best_program_id=None, island_idx=None, aux_name: str = ""):
+        super().__init__(cursor, conn, config, get_program_func, best_program_id, island_idx)
+        self.aux_name = aux_name
+
+    def sample_parent(self) -> Any:
+        from .aux_selection import build_aux_probabilities
+
+        direction = int(getattr(self.config, "aux_directions", {}).get(self.aux_name, 1))
+
+        # Same pool as WeightedSamplingStrategy: valid, archived, (optionally) this island.
+        if self.island_idx is not None:
+            self.cursor.execute(
+                """SELECT p.* FROM programs p JOIN archive a ON p.id = a.program_id
+                   WHERE p.correct = 1 AND p.island_idx = ?""",
+                (self.island_idx,),
+            )
+        else:
+            self.cursor.execute(
+                """SELECT p.* FROM programs p JOIN archive a ON p.id = a.program_id
+                   WHERE p.correct = 1"""
+            )
+        rows = self.cursor.fetchall()
+        if not rows:
+            return None
+
+        ids, aux_vals, oracle_vals, children = [], [], [], []
+        for row in rows:
+            d = dict(row)
+            priv = d.get("private_metrics")
+            if isinstance(priv, str):
+                try:
+                    priv = json.loads(priv)
+                except Exception:
+                    priv = {}
+            scores = (priv or {}).get("aux_scores") or {}
+            if self.aux_name not in scores:
+                continue  # program predates the aux, or evaluator failed
+            try:
+                aux_vals.append(float(scores[self.aux_name]))
+            except (TypeError, ValueError):
+                continue
+            ids.append(d["id"])
+            oracle_vals.append(float(d.get("combined_score") or 0.0))
+            children.append(float(d.get("children_count") or 0.0))
+
+        if len(ids) < 2:
+            return None  # not enough aux-scored programs to form a distribution
+
+        probs = build_aux_probabilities(
+            aux_vals,
+            direction,
+            children,
+            lam=getattr(self.config, "parent_selection_lambda", 10.0),
+            oracle_values=oracle_vals
+            if getattr(self.config, "aux_residualize", True)
+            else None,
+        )
+        if probs.size != len(ids) or not np.isfinite(probs).all():
+            return None
+
+        chosen = ids[int(np.random.choice(len(ids), p=probs))]
+        prog = self.get_program(chosen)
+        if prog is not None:
+            logger.debug(f"Aux[{self.aux_name}] sampled parent {chosen}")
+        return prog
+# === END ALG2 MOD (aux-selection) ===
+
+
 class WeightedSamplingStrategy(ParentSamplingStrategy):
     """Weighted sampling strategy for parent selection."""
 
@@ -745,7 +827,7 @@ class CombinedParentSelector:
         return None
 
     def sample_parent_with_fix_mode(
-        self, island_idx: Optional[int] = None
+        self, island_idx: Optional[int] = None, selection_arm: Optional[str] = None
     ) -> Tuple[Any, bool]:
         """
         Sample a parent, returning fix mode indicator if no correct programs exist.
@@ -767,11 +849,41 @@ class CombinedParentSelector:
                 raise ValueError("Database empty - no programs to sample or fix.")
 
         # Normal sampling - there are correct programs available
-        parent = self.sample_parent(island_idx)
+        parent = self.sample_parent(island_idx, selection_arm=selection_arm)
         return (parent, False)
 
-    def sample_parent(self, island_idx: Optional[int] = None) -> Any:
-        """Sample a parent using the configured sampling strategy."""
+    def sample_parent(
+        self, island_idx: Optional[int] = None, selection_arm: Optional[str] = None
+    ) -> Any:
+        """Sample a parent using the configured sampling strategy.
+
+        === ALG2 MOD (aux-selection) ===
+        `selection_arm` is chosen upstream by the runner's two-level bandit. When it is
+        None or "main" this behaves EXACTLY as before (the configured strategy). When it
+        names an aux, the parent is drawn from that aux's distribution instead. The
+        sampler stays stateless -- required because async sampling runs against read-only
+        thread-local DB copies that cannot persist bandit state.
+        """
+        if (
+            selection_arm
+            and selection_arm != "main"
+            and selection_arm in getattr(self.config, "aux_directions", {})
+        ):
+            strategy = AuxSamplingStrategy(
+                self.cursor,
+                self.conn,
+                self.config,
+                self.get_program,
+                self.best_program_id,
+                island_idx,
+                aux_name=selection_arm,
+            )
+            parent = strategy.sample_parent()
+            if parent is not None:
+                return parent
+            # fall through to the oracle strategy if the aux arm could not sample
+        # === END ALG2 MOD (aux-selection) ===
+
         strategy_name = self.config.parent_selection_strategy
 
         if strategy_name == "power_law":

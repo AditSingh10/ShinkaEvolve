@@ -1,0 +1,5 @@
+problem,arm,n_reps,valid_yield_median,ceiling_median
+circle,aux_treatment,5,0.229,2.451
+circle,control,5,0.159,2.447
+2048,aux_treatment,5,0.333,0.664
+2048,control,5,0.333,0.638
