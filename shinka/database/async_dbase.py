@@ -260,6 +260,8 @@ class AsyncProgramDatabase:
         max_novelty_attempts=None,
         resample_attempt=None,
         max_resample_attempts=None,
+        # === ALG2 MOD (aux-selection): arm chosen upstream by the bandit; None => unchanged.
+        selection_arm=None,
     ) -> Tuple[Program, List[Program], List[Program], bool]:
         """Async version of database sampling with fix mode detection.
 
@@ -296,6 +298,7 @@ class AsyncProgramDatabase:
                             max_novelty_attempts=max_novelty_attempts,
                             resample_attempt=resample_attempt,
                             max_resample_attempts=max_resample_attempts,
+                            selection_arm=selection_arm,  # ALG2 MOD (aux-selection)
                         )
                         self._debug_track_end(thread_op_id, success=True)
                         return result

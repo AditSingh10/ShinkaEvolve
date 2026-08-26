@@ -60,6 +60,18 @@ class EvolutionConfig:
     novelty_llm_models: Optional[List[str]] = None
     novelty_llm_kwargs: dict = field(default_factory=lambda: {})
     use_text_feedback: bool = False
+
+    # === ALG2 MOD (aux-selection): kwargs for the two-level aux bandit (beta_init,
+    # beta_floor, beta_cap, decay, reward_clip, ...). Only used when
+    # db_config.aux_directions is non-empty; empty dict => library defaults.
+    aux_bandit_kwargs: dict = field(default_factory=dict)
+    # === END ALG2 MOD (aux-selection) ===
+    # === STEERING MOD (event-triggered search steering): kwargs for SteeringConfig.
+    # None => feature entirely off (no controllers, no steering.jsonl). A dict (even {} =>
+    # spec defaults) turns on OBSERVE + LOG; the individual enable_* flags inside gate whether
+    # any steering actually alters selection/prompt. All-flags-off => observe-only baseline.
+    steering_kwargs: Optional[dict] = None
+    # === END STEERING MOD ===
     max_api_costs: Optional[float] = None
     inspiration_sort_order: str = "ascending"
     enable_controlled_oversubscription: bool = False

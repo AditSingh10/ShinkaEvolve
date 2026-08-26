@@ -1,0 +1,260 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+
+\definecolor{codebg}{RGB}{246,246,246}
+\lstset{basicstyle=\ttfamily\footnotesize, breaklines=true, columns=fullflexible,
+  frame=single, framesep=5pt, backgroundcolor=\color{codebg},
+  rulecolor=\color{black!25}, xleftmargin=4pt, xrightmargin=4pt}
+\newcommand{\code}[1]{\texttt{\small #1}}
+
+\title{\vspace{-2em}Algorithm 2 --- Aux-Guided Parent Selection\\
+\large A two-level non-stationary bandit over selection distributions}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+\vspace{-3em}
+
+\section{Overview and research question}
+ShinkaEvolve selects the parent to mutate by sampling from a distribution $P_0$ built from the
+\emph{oracle} score $O$ (sum of radii). \textbf{Algorithm 2} asks:
+
+\begin{quote}
+Given a fixed set of structural auxiliary signals, each a pair \code{(aux\_fn, direction)}, can we
+shape \emph{which parent breeds} --- via a bandit that learns online which auxes actually help ---
+so the search improves \emph{as measured on the untouched oracle}?
+\end{quote}
+
+Two invariants make this a valid test:
+\begin{itemize}[nosep]
+  \item \textbf{Oracle stays the yardstick.} $O$ is the only recorded/compared score. Auxes affect
+        \emph{only} parent selection.
+  \item \textbf{Scores stay private (no LLM feedback).} Unlike the earlier feedback experiments,
+        auxes are \emph{not} surfaced to the model. This isolates the \emph{selection} channel: any
+        effect is attributable to which parents were bred, nothing else.
+\end{itemize}
+Auxes are hand-supplied for now; automatic discovery (Algorithm~1) and the discovery$\leftrightarrow$bandit
+feedback loop are future work.
+
+\section{Baseline: the weighted selection distribution}
+The existing sampler weights each valid archived program $i$ by
+\[
+ w_i^{(0)} = \underbrace{\sigma\!\Big(\lambda\,\tfrac{O_i-\mathrm{med}(O)}{\mathrm{MAD}(O)}\Big)}_{\text{performance}}
+ \cdot \underbrace{\tfrac{1}{1+n_i}}_{\text{diversity}},\qquad
+ P_0(i)=\frac{w_i^{(0)}}{\sum_j w_j^{(0)}},
+\]
+with $\lambda=10$, $\mathrm{med}/\mathrm{MAD}$ = median / median-absolute-deviation (robust,
+scale-invariant standardization), $n_i$ = children count, $\sigma$ = logistic. This is our $P_0$;
+we build the aux distributions with the \emph{same} machinery.
+
+\section{Method}
+
+\subsection{Aux selection distributions}
+Each aux is a pair $(a_k, d_k)$ with score function $a_k(\cdot)$ and direction $d_k\in\{+1,-1\}$
+($+1$ = maximize, $-1$ = minimize). We form $P_k$ exactly as $P_0$ but replacing the performance
+term's score with the \emph{direction-oriented, standardized} aux score:
+\[
+ w_i^{(k)} = \sigma\!\Big(\lambda\, d_k\,\tfrac{a_k(i)-\mathrm{med}(a_k)}{\mathrm{MAD}(a_k)}\Big)\cdot\tfrac{1}{1+n_i},
+ \qquad P_k(i)=\frac{w_i^{(k)}}{\sum_j w_j^{(k)}}.
+\]
+The direction $d_k$ (supplied by whoever mints the aux) is the only thing that tells us whether the
+top or bottom half is favored; standardization handles scale. Same candidate pool as $P_0$ (the
+island's valid archive).
+
+\subsection{Two-level non-stationary bandit}
+We do \emph{not} treat $\{P_0,P_1,P_2,P_3\}$ as four equal arms: we \emph{know} $P_0$ is good and do
+\emph{not} yet know if any aux is. So we use two levels, encoding an asymmetric prior:
+\begin{itemize}[nosep]
+  \item \textbf{Top level ($\beta$):} choose \code{main} ($P_0$) with prob.\ $\beta$, else the
+        \emph{aux pool} with prob.\ $1-\beta$. $\beta$ = current confidence in oracle selection vs.\
+        structural exploration.
+  \item \textbf{Bottom level:} inside the pool, a sub-bandit picks which aux $k\in\{1,2,3\}$.
+\end{itemize}
+Both levels are \emph{non-stationary} (recency-weighted) so they track the search's phases. $\beta$ is
+initialized high, floored so the oracle stays anchored, and capped so the aux pool is never starved.
+
+\subsection{Reward: relative improvement (advantage)}
+When arm $m$ (one of \code{main},$a_1,a_2,a_3$) selects parent $p$ and the LLM mutates it into child
+$c$ (scored on $O$), the per-pull outcome is the \emph{immediate improvement}
+\[
+ \text{imp} = \begin{cases} O(c)-O(p) & c \text{ valid}\\ 0 & c \text{ invalid.}\end{cases}
+\]
+We keep a recency-weighted value $Q(m)$ for \emph{every} arm, \textbf{including \code{main}}. An aux's
+worth is its \textbf{advantage over the oracle arm}:
+\[
+ A(a_k) = Q(a_k) - Q(\text{main}).
+\]
+Tracking $Q(\text{main})$ is essential, for two reasons: (i) \emph{counterfactual} --- best-so-far
+climbs over generations regardless of arm, so raw improvement measures the search, not the arm;
+subtracting $Q(\text{main})$ asks ``did this aux beat what the oracle would have done?''; (ii)
+\emph{variance reduction} --- both arms suffer the same stochastic LLM-mutation noise, so the
+difference cancels the shared variance. The bottom-level weights follow $Q(a_k)$; $\beta$ follows
+$\max_k A(a_k)$ (aux pool earns weight only if some aux beats the oracle arm). Invalid children give
+$\text{imp}=0$, so an aux whose parents mutate into garbage is down-weighted automatically.
+
+\emph{Refinement (v2, not now):} replace immediate \code{imp} with a discounted sum over the parent's
+next-$k$ descendants, to credit slow-burning lineages. Start with immediate (low variance, no
+bookkeeping).
+
+\subsection{Adaptation --- the ``$\eta$'' (from shinka's bandit)}
+We reuse \code{AsymmetricUCB} (\code{shinka/llm/prioritization.py}). It has no per-step $\eta$;
+instead it keeps a \emph{decayed running sum} of rewards per arm and multiplies all arms' stats by
+\code{auto\_decay}$=0.95$ after every update. This is a recency-weighted average (effective
+$\eta\approx 1-0.95$; $\sim$20-observation memory) --- exactly the non-stationarity we want, at both
+levels. It also provides UCB exploration (\code{exploration\_coef}=1.0, auto-shrinks with pulls), an
+$\varepsilon$-floor (\code{epsilon}=0.2, so no arm is starved), and a \code{baseline} argument that
+implements the advantage shift directly.
+
+\subsection{Lineage tagging}
+Every child records \code{metadata["selection\_arm"]} $\in\{\text{main},a_1,a_2,a_3\}$. This gives
+credit assignment for the bandit and lets us trace, post-hoc, which arm produced the winning lineages.
+
+\section{Algorithm}
+\begin{lstlisting}
+Inputs: oracle O; auxes {(a_k, d_k)} k=1..3; archive per island (valid programs only)
+Bandits (AsymmetricUCB, auto_decay=0.95, eps=0.2, c=1.0):
+    TOP  over {main, pool}   with beta = P(main), init 0.85, in [0.50, 0.95]
+    SUB  over {a1, a2, a3}    init uniform
+Q(m) = recency-weighted value per arm (maintained by the bandits)
+
+for each generation:
+    island   <- pick island (equal)
+    # ---- choose a selection distribution (the arm) ----
+    if Bernoulli(beta):            arm <- main
+    else:                          arm <- SUB.select()          # a1 | a2 | a3
+    # ---- sample the parent from that arm's distribution ----
+    if arm == main:  parent ~ P0(island)                        # oracle-weighted
+    else:            parent ~ P_arm(island)                     # aux-weighted, oriented by d_k
+    tag child.metadata["selection_arm"] = arm
+
+    child <- LLM_mutate(parent);   O_c <- evaluate(child)       # O recorded, untouched
+    imp   <- (O_c - O(parent)) if valid(child) else 0
+
+    # ---- update the bandit that chose this arm ----
+    if arm == main:  TOP.update("main", imp)
+    else:            SUB.update(arm, imp);  TOP.update("pool", imp)
+    beta  <- clip( f(Q(main), max_k Q(a_k)), 0.50, 0.95 )       # advantage-driven, non-stationary
+    add child to archive
+\end{lstlisting}
+
+\section{The three auxiliary evaluators}
+Chosen to reward \emph{structural quality of the packing}, not surface regularity. We deliberately
+do \textbf{not} reward equal radii, symmetry, total area, or raw contact count --- the SOTA solution
+is asymmetric, uses several smaller circles, and gains value from heterogeneous local geometry. All
+are pure functions of \code{(centers, radii)}; ``contact'' = touching within a tolerance.
+
+\begin{enumerate}[leftmargin=1.4em]
+  \item \textbf{Directional caging} $a_1$, \emph{direction $+1$ (maximize)}.
+        For each circle, take the directions to its contacts (neighbors and touched walls); the
+        largest angular gap $g_i$ measures how freely it can move. A circle is \emph{caged} if
+        $g_i\le\pi$. $a_1 = \frac1n\sum_i \mathbf{1}[g_i\le\pi]$ (fraction caged).
+        \emph{Why:} penalizes ``loose'' circles that could shift without disturbing the rest; being
+        per-circle (not total count) it also enforces that support is \emph{distributed}.
+  \item \textbf{Largest residual hole} $a_2$, \emph{direction $-1$ (minimize)}.
+        Radius of the biggest empty disk that fits in the square without overlapping any circle:
+        $a_2=\max_{p\in[0,1]^2}\min\big(d_{\text{wall}}(p),\ \min_i(\lVert p-c_i\rVert-r_i)\big)$
+        (grid-approximated).
+        \emph{Why:} a large open region signals the layout could be reorganized to fit bigger circles.
+  \item \textbf{Boundary-anchored connectivity} $a_3$, \emph{direction $+1$ (maximize)}.
+        Build a contact graph (nodes = circles $+$ the four walls; edges = contacts). $a_3 =$
+        fraction of circles path-connected to a wall.
+        \emph{Why:} good packings form one boundary-anchored load-bearing network, not isolated
+        clusters.
+\end{enumerate}
+
+\section{Hyperparameters}
+\begin{table}[h]\centering\small
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{@{}>{\raggedright}p{0.20\textwidth} l >{\raggedright\arraybackslash}p{0.50\textwidth}@{}}
+\toprule
+\textbf{Symbol / knob} & \textbf{Value} & \textbf{Meaning \& justification} \\
+\midrule
+\multicolumn{3}{@{}l}{\emph{Selection distributions ($P_0$, $P_k$)}}\\
+$\lambda$ & 10 & sigmoid sharpness (inherited default); soft top/bottom-half filter. \\
+standardization & med / MAD & robust, scale-invariant; unaffected by outliers / score drift. \\
+diversity term & $1/(1+n_i)$ & discourages over-using one lineage; shared across arms. \\
+\midrule
+\multicolumn{3}{@{}l}{\emph{Two-level bandit (reuse \code{AsymmetricUCB})}}\\
+$\beta_{\text{init}}$ & 0.85 & prior confidence in oracle vs.\ auxes: start trusting $P_0$. \\
+$\beta$ range & $[0.50,\,0.95]$ & cap $0.95$ = aux pool always $\ge 5\%$ (never starved); floor $0.50$ = oracle stays majority anchor. \\
+\code{auto\_decay} & 0.95 & recency weighting ($\eta\!\approx\!0.05$, $\sim$20-obs memory) $\Rightarrow$ non-stationary, tracks phases. \\
+\code{exploration\_coef} $c$ & 1.0 & UCB exploration; auto-shrinks as an arm is pulled. \\
+\code{epsilon} & 0.2 & exploration floor; every arm keeps getting sampled. \\
+SUB init & uniform & no prior among auxes (symmetric ignorance). \\
+\midrule
+\multicolumn{3}{@{}l}{\emph{Reward}}\\
+improvement & $O(c){-}O(p)$, else 0 & immediate, low-variance; invalid child $\Rightarrow 0$. \\
+advantage & $Q(a_k){-}Q(\text{main})$ & counterfactual baseline + LLM-noise cancellation. \\
+\midrule
+\multicolumn{3}{@{}l}{\emph{Evolution / task (unchanged from the Qwen runs)}}\\
+patch type & \code{full} only & open models can't reproduce verbatim SEARCH blocks at temp 0. \\
+temperature & 0.7 & escapes the temp-0 deterministic trap for a weak model. \\
+islands / archive & 2 / 40 & baseline config; crowding archive selection. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Experimental protocol}
+\textbf{Task:} circle packing, $n=26$, maximize sum of radii (SOTA $\approx 2.635$).
+\begin{itemize}[nosep]
+  \item \textbf{Smoke run --- Qwen2.5-32B-Instruct-AWQ} (fast). Purpose: verify the bandit wiring,
+        lineage tags, both-level updates, and that $\beta$/$Q$ move. Short ($\sim$20--35 gens).
+  \item \textbf{Main run --- Qwen3-32B (thinking)}, \textbf{200 iterations}. Purpose: performance.
+  \item \textbf{Control} = identical config with $\beta\equiv 1$ (oracle-only selection, i.e.\ the
+        stock ShinkaEvolve sampler). The \emph{only} difference from treatment is aux-shaped selection.
+  \item Replicates as budget allows (local $\Rightarrow$ no API cost; wall-clock is the constraint,
+        esp.\ Qwen3 thinking at $\sim$22 tok/s).
+\end{itemize}
+
+\section{Analysis plan and metrics}
+Per run we log, per candidate: \code{oracle\_score}, \code{valid}, \code{selection\_arm}, the aux
+vector, and the bandit state ($\beta$, $Q(\cdot)$).
+\begin{enumerate}[nosep,leftmargin=1.4em]
+  \item \textbf{Best-so-far vs.\ iteration}, treatment vs.\ control (mean $\pm$ range over replicates).
+  \item \textbf{Sample efficiency:} iterations (and time) to reach score thresholds.
+  \item \textbf{$\beta(t)$ curve} --- \emph{the key diagnostic}: how much the run trusts structural
+        exploration over pure oracle selection, over time. Rising $\beta\to1$ = auxes not helping
+        (graceful degradation); a dip = auxes earning their keep mid-search.
+  \item \textbf{$Q(a_k)(t)$ curves} --- which aux earns credit, and when (phase dependence).
+  \item \textbf{Lineage attribution:} fraction of best-so-far improvements whose lineage passed
+        through each arm.
+\end{enumerate}
+
+\paragraph{Outcomes to record (all of them).}
+\begin{itemize}[nosep]
+  \item \emph{Ambitious wins:} reach a target score in \emph{fewer} iterations than control; or exceed
+        ShinkaEvolve's reported best.
+  \item \emph{Null / graceful:} $\beta\to1$, treatment $\approx$ control $\Rightarrow$ these auxes
+        add nothing but do no harm (validates the safety design).
+  \item \emph{Structural signal:} a specific aux dominates $Q$ $\Rightarrow$ evidence for which
+        structural property matters (feeds future discovery); a \emph{direction flip} implied by the
+        data $\Rightarrow$ the supplied direction was wrong.
+  \item \emph{Negative:} treatment underperforms control $\Rightarrow$ record; inspect whether the
+        floor/cap or reward horizon is at fault.
+\end{itemize}
+
+\section{Results}
+\emph{To be filled after the runs.}
+\begin{table}[h]\centering\small
+\begin{tabular}{@{}l cc cc@{}}
+\toprule
+& \multicolumn{2}{c}{Control ($\beta{\equiv}1$)} & \multicolumn{2}{c}{Treatment} \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}
+Model / run & best & iters-to-thr & best & iters-to-thr \\
+\midrule
+Qwen2.5 (smoke) & --- & --- & --- & --- \\
+Qwen3 (200 it) & --- & --- & --- & --- \\
+\bottomrule
+\end{tabular}
+\end{table}
+\noindent Figures to attach: best-so-far curves; $\beta(t)$; $Q(a_k)(t)$; lineage-attribution bars.
+
+\end{document}

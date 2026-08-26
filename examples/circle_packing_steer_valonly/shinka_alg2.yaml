@@ -1,0 +1,123 @@
+# === PILOT MOD (aux-eval): LOCAL Qwen config. All LLM roles served by vLLM on /data. ===
+# Generation + novelty: Qwen2.5-32B-Instruct-AWQ (general model) at http://localhost:8000/v1
+# Embeddings: Qwen3-Embedding-0.6B at http://localhost:8001/v1
+# No API keys needed; local models cost ~$0 so num_generations is the stopping criterion.
+# For a local model ShinkaEvolve honors temperature, so we can run deterministically (temp 0).
+
+max_evaluation_jobs: 4
+max_proposal_jobs: 4
+max_db_workers: 4
+
+db_config:
+  num_islands: 2
+  archive_size: 40
+  elite_selection_ratio: 0.3
+  num_archive_inspirations: 1
+  num_top_k_inspirations: 1
+  migration_interval: 10
+  migration_rate: 0.1
+  island_elitism: true
+  enforce_island_separation: true
+  parent_selection_strategy: weighted
+
+  # === ALG2 MOD (aux-selection): aux arms + direction priors. ===
+  # Empty => feature off. Aux scores come from private_metrics["aux_scores"] written by
+  # evaluate.py; they are NEVER shown to the model (pure selection intervention).
+  aux_directions:
+    caging: 1     # maximize: mean caging margin (few loose circles, support distributed)
+    hole: -1      # minimize: radius of the largest residual empty disk
+    connect: 1    # maximize: Fiedler value of the boundary-anchored contact graph
+  # Regress the oracle out of each aux before selecting: raw auxes correlate with the
+  # oracle (rho 0.52-0.86) and would otherwise just re-pick the oracle's own parents.
+  aux_residualize: true
+  # === END ALG2 MOD (aux-selection) ===
+  parent_selection_lambda: 10
+  archive_selection_strategy: "crowding"
+  island_selection_strategy: equal
+  archive_criteria:
+    combined_score: 1.0
+    loc: -0.3
+  enable_dynamic_islands: false
+  stagnation_threshold: 10
+  island_spawn_strategy: "best"
+  island_spawn_subtree_size: 2
+
+evo_config:
+  # Qwen (and open models generally) do NOT reproduce source text verbatim, so the `diff`
+  # SEARCH/REPLACE format can't apply -- and at temp 0 every resample is identical, so diff
+  # proposals are pure waste. Use `full` only (rewrite the whole EVOLVE-BLOCK; no verbatim
+  # match needed). This is a native ShinkaEvolve patch type; the diff/SEARCH code is untouched.
+  patch_types:
+    - full
+  patch_type_probs:
+    - 1.0
+
+  num_generations: 200
+  max_api_costs: 1000.0     # local models are ~free; this never binds (stop on generations)
+
+  max_patch_resamples: 4
+  max_patch_attempts: 1
+  max_novelty_attempts: 1
+  job_type: local
+  language: python
+
+  # --- LOCAL Qwen generation model (served by vLLM) ---
+  llm_models:
+    - "local/qwen32b@http://localhost:8000/v1"
+  llm_kwargs:
+    temperatures:
+      - 0.7               # raised from 0: temp 0 + seed-only archive => deterministic repeats
+                          # of the same bugs. 0.7 gives diverse attempts so valid children appear.
+    reasoning_efforts:
+      - ""                # local model; unused. (Qwen3 thinking is handled server-side by
+                          # vLLM's --reasoning-parser qwen3, not via this field.)
+    max_tokens: 8192      # Qwen2.5 is non-thinking: short outputs. 32768-8192 = 24,576 tokens
+                          # of prompt headroom (prompt holds parent + 2 inspirations).
+
+  # single fixed local model -> no bandit
+  llm_dynamic_selection: null
+
+  enable_controlled_oversubscription: false
+  proposal_target_mode: adaptive
+  proposal_target_min_samples: 8
+  proposal_target_ratio_cap: 1.75
+  proposal_buffer_max: 6
+  proposal_target_hard_cap: 26
+  proposal_target_ewma_alpha: 0.25
+
+  meta_rec_interval: null
+  meta_llm_models:
+    - "local/qwen32b@http://localhost:8000/v1"
+  meta_llm_kwargs:
+    temperatures:
+      - 0.0
+    max_tokens: 8192
+
+  # --- LOCAL embedding model (served by vLLM) ---
+  embedding_model: "local/qwen-embed@http://localhost:8001/v1"
+  code_embed_sim_threshold: 0.99
+
+  # --- novelty check also on local Qwen ---
+  novelty_llm_models:
+    - "local/qwen32b@http://localhost:8000/v1"
+  novelty_llm_kwargs:
+    temperatures:
+      - 0.0
+
+  init_program_path: initial.py
+  # === ALG2 MOD (aux-selection): two-level bandit knobs (calibrated for ~200 gens). ===
+  aux_bandit_kwargs:
+    beta_init: 0.70      # start trusting the oracle arm, but leave ~30% for the aux pool
+    beta_floor: 0.40     # oracle keeps a substantial share
+    beta_cap: 0.90       # aux pool never starved (>=10%)
+    beta_step: 0.05
+    kappa: 5.0           # advantage sensitivity; reward ratio is ~[0,1.2]
+    decay: 0.80          # eta=0.2 -> converges within ~20 pulls per aux
+    reward_clip: 2.0     # non-binding guard (only bites at cold start)
+    tau: 0.15            # within-pool SOFTMAX temperature over q_aux (replaces the UCB)
+    epsilon: 0.15        # softmax exploration floor: no aux ever starved
+  # === END ALG2 MOD (aux-selection) ===
+
+  results_dir: results/alg2
+  evolve_prompts: False
+# === END PILOT MOD (aux-eval) ===

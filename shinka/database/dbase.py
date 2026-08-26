@@ -92,6 +92,26 @@ class DatabaseConfig:
     # Weighted tree parent selection parameters
     parent_selection_lambda: float = 10.0  # >0 sharpness of sigmoid
 
+    # === ALG2 MOD (aux-selection): aux-shaped parent selection. ===
+    # Maps aux name -> direction prior (+1 maximize / -1 minimize). Aux scores are read
+    # from each program's private_metrics["aux_scores"] (written by the task evaluator).
+    # Empty dict (default) => feature OFF and selection behaves exactly as before.
+    aux_directions: dict = field(default_factory=dict)
+    # Regress the oracle out of the aux before selecting, so an aux that merely
+    # correlates with the oracle does not just re-pick the oracle's own parents.
+    aux_residualize: bool = True
+    # --- CONTINUOUS-BOOTSTRAP (fixed pool, bandit swaps the active subset) ---
+    # aux_pool maps EVERY aux in the pre-generated pool -> its direction prior. The
+    # evaluator computes all of them for every program; aux_directions holds only the
+    # currently ACTIVE subset (the bandit's arms). Every swap_interval generations the
+    # runner drops the worst `swap_drop` active arms (by shrunk q) and activates that many
+    # untried pool members, until the pool is exhausted. Empty aux_pool => no swapping.
+    aux_pool: dict = field(default_factory=dict)
+    aux_swap_interval: int = 0        # generations between swaps (0 => off)
+    aux_swap_drop: int = 2            # active arms replaced per swap
+    aux_swap_min_pulls: int = 3       # an arm must have >= this many pulls to be droppable
+    # === END ALG2 MOD (aux-selection) ===
+
     # Beam search parent selection parameters
     num_beams: int = 5
 
@@ -1311,6 +1331,8 @@ class ProgramDatabase:
         max_novelty_attempts=None,
         resample_attempt=None,
         max_resample_attempts=None,
+        # === ALG2 MOD (aux-selection): arm chosen upstream by the bandit; None => unchanged.
+        selection_arm=None,
     ) -> Tuple[Program, List[Program], List[Program], bool]:
         """
         Sample a parent program, returning fix mode indicator if no correct
@@ -1441,7 +1463,8 @@ class ProgramDatabase:
 
         # Use the new method that returns fix mode
         parent, needs_fix = parent_selector.sample_parent_with_fix_mode(
-            island_idx=sampled_island
+            island_idx=sampled_island,
+            selection_arm=selection_arm,  # ALG2 MOD (aux-selection)
         )
         if not parent:
             raise RuntimeError(f"Failed to sample parent from island {sampled_island}")

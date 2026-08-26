@@ -1,0 +1,10 @@
+problem,arm,n_reps,valid_yield_median,ceiling_median,dominant_failure
+circle,baseline,5,0.129,2.458,overlap
+circle,steer_full,5,0.229,1.995,runtime
+circle,validity_only,5,0.229,2.152,runtime
+2048,baseline,5,0.363,0.746,runtime
+2048,steer_full,5,0.343,0.626,runtime
+go,baseline,5,0.070,99.732,compile
+go,steer_full,5,0.170,99.737,compile
+julia,baseline,5,0.090,99.756,compile
+julia,steer_full,5,0.230,99.746,compile

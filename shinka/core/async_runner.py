@@ -173,6 +173,10 @@ class AsyncRunningJob:
     completion_detected_at: Optional[float] = None
     discard_if_completed: bool = False
     evaluation_slot_released: bool = False
+    # === ALG2 MOD (aux-selection): which selection distribution chose this job's parent.
+    # Carried from proposal -> evaluated child so the bandit can be credited and the
+    # lineage tagged. None means the ordinary oracle sampler was used.
+    selection_arm: Optional[str] = None
 
 
 @dataclass
@@ -193,6 +197,17 @@ class CompletedJobPersistResult:
     job: AsyncRunningJob
     success: bool
     persisted_event: Optional[PersistedProgramEvent] = None
+
+
+def _parse_local_model(spec: str) -> tuple[str, str]:
+    """Parse 'local/qwen32b@http://localhost:8000/v1' -> ('qwen32b', 'http://localhost:8000/v1').
+    Falls back to (spec, '') for non-local specs. Used by the steering family summarizer."""
+    name, url = spec, ""
+    if "@" in spec:
+        name, url = spec.split("@", 1)
+    if "/" in name:
+        name = name.split("/", 1)[1]  # strip 'local/'
+    return name, url
 
 
 def _dedupe_model_names(model_names: Iterable[str]) -> list[str]:
@@ -417,6 +432,72 @@ class ShinkaEvolveRunner:
             )
         else:
             raise ValueError("Invalid llm_dynamic_selection")
+
+        # === ALG2 MOD (aux-selection): two-level bandit over selection distributions. ===
+        # Mirrors self.llm_selection: it lives on the runner (state must persist, and async
+        # sampling runs against read-only thread-local DBs), picks an arm before sampling,
+        # and is credited after the child is evaluated. Off unless db_config.aux_directions
+        # is non-empty, in which case selection behaves exactly as before.
+        self.aux_selection = None
+        _aux_dirs = dict(getattr(db_config, "aux_directions", {}) or {})
+        if _aux_dirs:
+            from shinka.database.aux_selection import TwoLevelAuxBandit
+
+            self.aux_selection = TwoLevelAuxBandit(
+                aux_names=list(_aux_dirs.keys()),
+                **dict(getattr(evo_config, "aux_bandit_kwargs", {}) or {}),
+            )
+            logger.info(f"ALG2 aux-selection ON: arms={list(_aux_dirs.keys())}")
+        # --- CONTINUOUS-BOOTSTRAP state: fixed pool, bandit swaps the active subset ---
+        self._aux_pool = dict(getattr(db_config, "aux_pool", {}) or {})
+        # untried = pool members not currently active; preserves pool order for fair intake
+        self._aux_untried = [k for k in self._aux_pool if k not in _aux_dirs]
+        self._aux_retired = []          # dropped arms (name, final shrunk-q) for the log
+        self._last_aux_swap_gen = 0
+        if self._aux_pool and self.aux_selection is not None:
+            logger.info(
+                f"ALG2 bootstrap ON: pool={len(self._aux_pool)} "
+                f"active={list(_aux_dirs.keys())} untried={self._aux_untried} "
+                f"swap_every={getattr(db_config,'aux_swap_interval',0)} "
+                f"drop={getattr(db_config,'aux_swap_drop',2)}"
+            )
+        # === END ALG2 MOD (aux-selection) ===
+
+        # === STEERING MOD (event-triggered search steering): observe-only wiring. ===
+        # Controllers live on the runner (like aux_selection). Presence of steering_kwargs turns
+        # on OBSERVE + LOG; the enable_* flags inside gate whether selection/prompt actually change
+        # (all-off => pure observe-only, NORMAL == baseline). Guarded so it can never break init.
+        self.steering = None
+        _sk = getattr(evo_config, "steering_kwargs", None)
+        if _sk is not None:
+            try:
+                from shinka.core.steering import (
+                    SteeringConfig, FamilyManager, DiversityController,
+                    ValidityController, SteeringPolicy,
+                )
+                self.steer_cfg = SteeringConfig(**dict(_sk))
+                self.steer_fam = FamilyManager(self.steer_cfg)
+                self.steer_div = DiversityController(self.steer_cfg)
+                self.steer_val = ValidityController(self.steer_cfg)
+                self.steer_pol = SteeringPolicy(
+                    self.steer_cfg, self.steer_fam, self.steer_div, self.steer_val)
+                self.steer_b = 0                                  # proposal counter (all proposals)
+                self.steer_B = max(1, int(getattr(evo_config, "num_generations", 200)))
+                self._steer_summary_tasks: Set[asyncio.Task] = set()
+                self._steer_gen_model, self._steer_gen_url = _parse_local_model(
+                    (evo_config.llm_models or [""])[0])
+                self._steer_emb_model, self._steer_emb_url = _parse_local_model(
+                    evo_config.embedding_model or "")
+                self.steering = True
+                _steer_acts = (self.steer_cfg.enable_diversity_controller
+                               or self.steer_cfg.enable_validity_controller)
+                logger.info(
+                    f"STEERING ON (observe{'+steer' if _steer_acts else '-only'}): "
+                    f"classes={self.steer_val.classes}, B={self.steer_B}")
+            except Exception as e:  # noqa: BLE001 - steering must never break the runner
+                logger.warning(f"STEERING init failed, disabling: {e}")
+                self.steering = None
+        # === END STEERING MOD ===
 
         # Store db_config for later initialization (after results_dir is set)
         # Database will be initialized in _setup_async()
@@ -700,6 +781,11 @@ class ShinkaEvolveRunner:
                 generation,
                 e,
             )
+        # === STEERING MOD: count a terminal pre-eval failure (e.g. novelty-rejected) as a
+        # proposal (increments b) so t = b/B reflects the full budget. Guarded. ===
+        if status == "failed":
+            self._steering_after_rejection(stage)
+        # === END STEERING MOD ===
 
     def _validate_concurrency_settings(
         self,
@@ -998,6 +1084,144 @@ class ShinkaEvolveRunner:
             len(self.active_proposal_tasks),
             len(self.running_jobs),
         )
+
+    # === ALG2 MOD (aux-selection): parent-distribution divergence diagnostic. ===
+    def _log_aux_divergence(self, generation: Optional[int]) -> None:
+        """Append per-aux JS/TV divergence (aux parent dist vs oracle) over the archive.
+
+        Read-only snapshot of the live archive; reuses the exact selection distributions
+        from aux_selection. Written to aux_divergence.jsonl. Wrapped so a failure here can
+        never affect the run. Only meaningful in treatment (aux_directions non-empty)."""
+        import sqlite3
+
+        from shinka.database.aux_selection import aux_oracle_divergences
+
+        aux_dirs = getattr(self.db_config, "aux_directions", {}) or {}
+        if not aux_dirs:
+            return
+        try:
+            conn = sqlite3.connect(
+                f"file:{self.db.config.db_path}?mode=ro", uri=True, timeout=10.0
+            )
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """SELECT p.combined_score, p.children_count, p.private_metrics
+                   FROM programs p JOIN archive a ON p.id = a.program_id
+                   WHERE p.correct = 1"""
+            ).fetchall()
+            conn.close()
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"aux-divergence: archive read failed: {e}")
+            return
+
+        names = list(aux_dirs.keys())
+        oracle_vals, children, aux_matrix = [], [], {k: [] for k in names}
+        for r in rows:
+            priv = r["private_metrics"]
+            if isinstance(priv, str):
+                try:
+                    priv = json.loads(priv)
+                except Exception:
+                    priv = {}
+            scores = (priv or {}).get("aux_scores") or {}
+            if any(k not in scores for k in names):
+                continue  # only pool programs that carry every aux
+            oracle_vals.append(float(r["combined_score"] or 0.0))
+            children.append(float(r["children_count"] or 0.0))
+            for k in names:
+                aux_matrix[k].append(float(scores[k]))
+
+        div = aux_oracle_divergences(
+            names,
+            {k: int(v) for k, v in aux_dirs.items()},
+            oracle_vals,
+            children,
+            aux_matrix,
+            lam=float(getattr(self.db_config, "parent_selection_lambda", 10.0)),
+            residualize=bool(getattr(self.db_config, "aux_residualize", True)),
+        )
+        if not div:
+            return
+        row = {"generation": generation, "pool_size": len(oracle_vals)}
+        for k in names:
+            row[f"js_{k}"] = div.get(k, {}).get("js")
+            row[f"tv_{k}"] = div.get(k, {}).get("tv")
+        try:
+            with open(
+                os.path.join(self.results_dir, "aux_divergence.jsonl"), "a"
+            ) as f:
+                f.write(json.dumps(row) + "\n")
+        except Exception:
+            pass
+    # === END ALG2 MOD (aux-selection) ===
+
+    # === ALG2 MOD (aux-selection): continuous-bootstrap aux swap. ===
+    def _maybe_bootstrap_swap(self, generation: Optional[int]) -> None:
+        """Every aux_swap_interval gens, drop the worst DROPPABLE active arm(s) and
+        activate that many untried pool members. Champions (kept arms) retain their q.
+
+        Mutates db_config.aux_directions IN PLACE (the same dict every sampler reads, so the
+        change is live) and the bandit's arm set. Fully gated + wrapped: a failure here can
+        never perturb evolution. No LLM, no discovery -- pure bandit-q selection over a
+        fixed pool. Writes each swap to aux_swaps.jsonl."""
+        bandit = self.aux_selection
+        interval = int(getattr(self.db_config, "aux_swap_interval", 0) or 0)
+        if bandit is None or not self._aux_pool or interval <= 0:
+            return
+        if generation is None or generation < self._last_aux_swap_gen + interval:
+            return
+        if not self._aux_untried:  # pool exhausted -> stop swapping, keep refining
+            self._last_aux_swap_gen = generation
+            return
+        try:
+            drop_n = int(getattr(self.db_config, "aux_swap_drop", 2))
+            min_pulls = int(getattr(self.db_config, "aux_swap_min_pulls", 3))
+            # candidates to drop: active arms with enough pulls to have been fairly judged
+            # (protects freshly-added arms from premature elimination), worst-first
+            ranked = bandit.rank_arms()  # best -> worst by shrunk q
+            droppable = [a for a in reversed(ranked)
+                         if bandit.pulls.get(a, 0) >= min_pulls]
+            n = min(drop_n, len(droppable), len(self._aux_untried))
+            if n <= 0:
+                self._last_aux_swap_gen = generation
+                return
+            dropped = droppable[:n]
+            added = self._aux_untried[:n]
+
+            aux_dirs = self.db_config.aux_directions  # SAME dict the samplers read
+            snap = {a: round(bandit.q_aux.get(a, 0.0), 4) for a in bandit.active_arms()}
+            for a in dropped:
+                q_final = round(bandit.q_aux.get(a, 0.0), 4)
+                bandit.remove_arm(a)
+                aux_dirs.pop(a, None)
+                self._aux_retired.append((a, q_final))
+            for nm in added:
+                bandit.add_arm(nm)
+                aux_dirs[nm] = int(self._aux_pool.get(nm, 1))
+                self._aux_untried.remove(nm)
+
+            self._last_aux_swap_gen = generation
+            row = {
+                "generation": generation,
+                "dropped": [{"aux": a, "q": q} for a, q in
+                            [(d, snap.get(d)) for d in dropped]],
+                "added": added,
+                "active_after": bandit.active_arms(),
+                "untried_left": list(self._aux_untried),
+            }
+            try:
+                with open(os.path.join(self.results_dir, "aux_swaps.jsonl"), "a") as f:
+                    f.write(json.dumps(row) + "\n")
+            except Exception:
+                pass
+            logger.info(
+                f"ALG2 bootstrap swap @gen{generation}: dropped {dropped} "
+                f"-> added {added} | active={bandit.active_arms()} "
+                f"| untried_left={len(self._aux_untried)}"
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"ALG2 bootstrap swap skipped: {e}")
+    # === END ALG2 MOD (aux-selection) ===
 
     def run(self):
         """Synchronous convenience wrapper for script/CLI usage."""
@@ -2739,6 +2963,13 @@ class ShinkaEvolveRunner:
         for attempt in range(self.evo_config.max_novelty_attempts):
             for resample in range(self.evo_config.max_patch_resamples):
                 try:
+                    # === ALG2 MOD (aux-selection): pick the selection distribution. ===
+                    # None when the feature is off -> sampling is unchanged.
+                    selection_arm = (
+                        self.aux_selection.select_arm() if self.aux_selection else None
+                    )
+                    # === END ALG2 MOD (aux-selection) ===
+
                     # Sample parent and inspirations with fix mode detection
                     (
                         parent_program,
@@ -2751,6 +2982,7 @@ class ShinkaEvolveRunner:
                         max_novelty_attempts=self.evo_config.max_novelty_attempts,
                         resample_attempt=resample + 1,
                         max_resample_attempts=self.evo_config.max_patch_resamples,
+                        selection_arm=selection_arm,  # ALG2 MOD (aux-selection)
                     )
 
                     # Sync beam_search parent to main database if using beam_search strategy
@@ -2783,6 +3015,26 @@ class ShinkaEvolveRunner:
                             model_posterior=model_posterior,
                         )
                     else:
+                        # === STEERING MOD (act half): mode-specific parent/inspiration override
+                        # + prompt block. NORMAL / act-flags-off => inputs unchanged. Guarded. ===
+                        steer_mode = "NORMAL"
+                        steer_pfam_summary = steer_ifam_summary = ""
+                        if self.steering:
+                            steer_mode = self._steering_snapshot_mode()
+                            if steer_mode != "NORMAL":
+                                (
+                                    parent_program,
+                                    archive_programs,
+                                    top_k_programs,
+                                    steer_pfam_summary,
+                                    steer_ifam_summary,
+                                ) = await self._steering_act(
+                                    steer_mode,
+                                    parent_program,
+                                    archive_programs,
+                                    top_k_programs,
+                                )
+                        # === END STEERING MOD (act half) ===
                         # NORMAL MODE: Generate patch
                         patch_result = await self._run_patch_async(
                             parent_program,
@@ -2794,6 +3046,9 @@ class ShinkaEvolveRunner:
                             resample_attempt=resample + 1,
                             model_sample_probs=model_sample_probs,
                             model_posterior=model_posterior,
+                            steer_mode=steer_mode,
+                            steer_parent_family_summary=steer_pfam_summary,
+                            steer_insp_family_summary=steer_ifam_summary,
                         )
 
                     if not patch_result:
@@ -2963,6 +3218,7 @@ class ShinkaEvolveRunner:
                     embed_cost=embed_cost,
                     novelty_cost=novelty_total_cost,  # Store novelty cost in running job
                     proposal_task_id=task_id,
+                    selection_arm=selection_arm,  # ALG2 MOD (aux-selection)
                 )
 
                 # Update costs
@@ -3630,6 +3886,9 @@ class ShinkaEvolveRunner:
         resample_attempt: int = 1,
         model_sample_probs: Optional[List[float]] = None,
         model_posterior: Optional[List[float]] = None,
+        steer_mode: str = "NORMAL",
+        steer_parent_family_summary: str = "",
+        steer_insp_family_summary: str = "",
     ) -> Optional[Tuple[Optional[str], Dict[str, Any], bool]]:
         """Run async patch generation."""
         # Initialize prompt-related variables outside try block for exception handling
@@ -3654,6 +3913,25 @@ class ShinkaEvolveRunner:
 
             # Restore original task_sys_msg
             self.prompt_sampler.task_sys_msg = original_task_sys_msg
+
+            # === STEERING MOD (act half): append the mode-specific steering block to the user
+            # message. build_prompt_addition returns "" unless enable_mode_prompt_conditioning is
+            # on AND mode != NORMAL, so NORMAL/baseline is byte-identical. Guarded. ===
+            if getattr(self, "steering", None) and steer_mode != "NORMAL":
+                try:
+                    block = self.steer_pol.build_prompt_addition(
+                        steer_mode, self.steer_b, self.steer_B,
+                        self.steer_b / self.steer_B,
+                        steer_parent_family_summary, steer_insp_family_summary)
+                    if block:
+                        patch_msg = (patch_msg or "") + block
+                        logger.info(
+                            f"STEERING ACT [{steer_mode}] gen {generation}: +{len(block)}c prompt "
+                            f"block (active={self.steer_val.active_constraint()}, "
+                            f"K={self.steer_fam.num_families()}, gamma={self.steer_div.gamma:.2f})")
+                except Exception as e:  # noqa: BLE001
+                    logger.debug(f"steering prompt block skipped: {e}")
+            # === END STEERING MOD (act half) ===
 
             # Convert numpy string to regular Python string
             patch_type = str(patch_type)
@@ -4073,6 +4351,168 @@ class ShinkaEvolveRunner:
             )
             return None
 
+    # === STEERING MOD: observe-only controller updates (guarded; never breaks the loop). ===
+    _STEER_SUMMARY_SYS = (
+        "You are an expert at classifying optimization algorithms. Given a program, output ONLY a "
+        "short structured summary, one field per line:\nsolver_family:\ninitialization:\n"
+        "global_search:\nlocal_search:\nrepair_strategy:\nrepresentation:\nkey_mechanism:\n"
+        "Be terse (a few words per field). Describe the ALGORITHM, not code style.")
+
+    def _steering_snapshot_mode(self) -> str:
+        if not self.steering:
+            return "NORMAL"
+        try:
+            return self.steer_pol.current_mode()
+        except Exception:
+            return "NORMAL"
+
+    def _steering_acts(self) -> bool:
+        """True if any steering ACT flag is on (so the mode can change the search)."""
+        c = self.steer_cfg
+        return bool(c.enable_mode_specific_island_sampling
+                    or c.enable_mode_specific_inspiration_sampling
+                    or c.enable_mode_prompt_conditioning)
+
+    async def _steering_after_eval(self, program, error_msg=None) -> None:
+        """Once per EVALUATED child (valid or invalid), at persist time."""
+        if not self.steering:
+            return
+        try:
+            from shinka.core.steering import classify_failure
+            self.steer_b += 1
+            t = self.steer_b / self.steer_B
+            correct = bool(program.correct)
+            violations = (program.private_metrics or {}).get("violations")
+            failure = classify_failure(correct, violations, error_msg)
+            parent_fam = (self.steer_fam.family_of(program.parent_id)
+                          if program.parent_id else None)
+            self.steer_val.update_child(failure, parent_fam)
+            if correct and program.code:
+                # When steering ACTS, family counts must be current for the next steering
+                # decision -> assign synchronously. In observe-only, background it (never block).
+                if self._steering_acts():
+                    await self._steer_assign_family(program)
+                else:
+                    task = asyncio.create_task(self._steer_assign_family(program))
+                    self._steer_summary_tasks.add(task)
+                    task.add_done_callback(self._steer_summary_tasks.discard)
+            self.steer_div.observe(self.steer_fam.counts(), t)
+            self._steering_maybe_check()
+            self._steering_log("valid" if correct else "invalid", program.id,
+                               program.parent_id, program.generation,
+                               program.combined_score or 0.0)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"steering after_eval skipped: {e}")
+
+    def _steering_after_rejection(self, failure_class: str) -> None:
+        """Once per terminal pre-eval failure (novelty-rejected etc.): count b + log."""
+        if not self.steering:
+            return
+        try:
+            self.steer_b += 1
+            t = self.steer_b / self.steer_B
+            self.steer_div.observe(self.steer_fam.counts(), t)
+            self._steering_maybe_check()
+            self._steering_log("rejected:" + (failure_class or "?"), None, None, None, 0.0)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"steering after_rejection skipped: {e}")
+
+    def _steering_maybe_check(self) -> None:
+        if (self.steer_b > self.steer_cfg.controller_warmup
+                and self.steer_b % self.steer_cfg.controller_check_interval == 0):
+            self.steer_div.check()
+            self.steer_val.check()
+
+    async def _steering_act(self, mode, parent, archive_programs, top_k_programs):
+        """ACT half: under a steering mode, optionally override the parent (family-constrained
+        pool) and inspirations (cross-family / feasibility-biased). Returns
+        (parent, archive_programs, top_k_programs, parent_family_summary, insp_family_summary).
+        NORMAL / act-flags-off leaves everything unchanged. Fully guarded."""
+        if not self.steering or mode == "NORMAL":
+            return parent, archive_programs, top_k_programs, "", ""
+        import numpy as np
+        cfg = self.steer_cfg
+        t = self.steer_b / self.steer_B
+        pfam_summary, ifam_summary = "", ""
+        rng = np.random.RandomState()
+        try:
+            # (a) family-constrained parent pool: pick target family, draw a parent from its members
+            if cfg.enable_mode_specific_island_sampling and self.steer_fam.num_families() > 0:
+                fstar = self.steer_pol.sample_family(mode, t, rng)
+                cands = []
+                for pid in self.steer_fam.members(fstar):
+                    p = await self.async_db.get_async(pid)
+                    if p is not None and getattr(p, "correct", False):
+                        cands.append(p)
+                if cands:
+                    sc = np.array([c.combined_score or 0.0 for c in cands], float)
+                    probs = np.exp((sc - sc.max()) / 0.2); probs = probs / probs.sum()
+                    parent = cands[int(rng.choice(len(cands), p=probs))]
+                    pfam_summary = self.steer_fam.summary(fstar)
+            # (b) cross-family / feasibility-biased inspiration
+            if cfg.enable_mode_specific_inspiration_sampling and self.steer_fam.num_families() > 1:
+                parent_fam = self.steer_fam.family_of(parent.id)
+                if parent_fam is None:
+                    parent_fam = 0
+                scores = np.asarray(self.steer_pol.inspiration_family_scores(mode, parent_fam, t))
+                order = list(np.argsort(-scores))
+                if mode in ("DIVERSITY_STEERING", "COMBINED_STEERING"):
+                    order = [j for j in order if j != parent_fam] or order
+                target = int(order[0])
+                ifam_summary = self.steer_fam.summary(target)
+                insp = []
+                for pid in self.steer_fam.members(target)[: max(1, len(archive_programs))]:
+                    p = await self.async_db.get_async(pid)
+                    if p is not None:
+                        insp.append(p)
+                if insp:
+                    archive_programs = insp
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"steering act skipped: {e}")
+        return parent, archive_programs, top_k_programs, pfam_summary, ifam_summary
+
+    async def _steer_assign_family(self, program) -> None:
+        try:
+            summ, emb = await asyncio.to_thread(self._steer_summarize_embed_sync, program.code)
+            if emb is not None:
+                self.steer_fam.assign(program.id, emb, program.combined_score or 0.0, summ)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"steering family assign skipped: {e}")
+
+    def _steer_summarize_embed_sync(self, code: str):
+        from openai import OpenAI
+        import numpy as np
+        if not getattr(self, "_steer_gen_client", None):
+            self._steer_gen_client = OpenAI(base_url=self._steer_gen_url, api_key="local")
+            self._steer_emb_client = OpenAI(base_url=self._steer_emb_url, api_key="local")
+        r = self._steer_gen_client.chat.completions.create(
+            model=self._steer_gen_model, temperature=0.0, max_tokens=256,
+            messages=[{"role": "system", "content": self._STEER_SUMMARY_SYS},
+                      {"role": "user", "content": (code or "")[:6000]}])
+        s = r.choices[0].message.content.strip()
+        v = self._steer_emb_client.embeddings.create(
+            model=self._steer_emb_model, input=s).data[0].embedding
+        return s, np.array(v)
+
+    def _steering_log(self, kind, pid, parent, gen, score) -> None:
+        try:
+            import json
+            rec = dict(b=self.steer_b, t=round(self.steer_b / self.steer_B, 4), kind=kind,
+                       pid=pid, parent=parent, gen=gen, score=score,
+                       mode=self._steering_snapshot_mode(), K=self.steer_fam.num_families(),
+                       H=round(self.steer_div.H, 4), H_target=round(self.steer_div.H_target, 4),
+                       gamma=round(self.steer_div.gamma, 4),
+                       dominant=round(self.steer_div.dominant, 4),
+                       active_k=self.steer_val.active_constraint(),
+                       lam={k: round(self.steer_val.lam[k], 4) for k in self.steer_val.classes},
+                       r={k: round(self.steer_val.r[k], 4) for k in self.steer_val.classes},
+                       div_active=self.steer_div.active, val_active=self.steer_val.active)
+            with open(Path(self.results_dir) / "steering.jsonl", "a") as f:
+                f.write(json.dumps(rec) + "\n")
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"steering log skipped: {e}")
+    # === END STEERING MOD ===
+
     async def _persist_completed_job(
         self, job: AsyncRunningJob
     ) -> CompletedJobPersistResult:
@@ -4179,6 +4619,9 @@ class ShinkaEvolveRunner:
                 metadata=with_pipeline_timing(
                     {
                         **(job.meta_patch_data or {}),
+                        # ALG2 MOD (aux-selection): lineage tag -- which distribution
+                        # chose this program's parent (None => ordinary oracle sampler).
+                        "selection_arm": job.selection_arm,
                         "embed_cost": job.embed_cost,
                         "novelty_cost": job.novelty_cost,
                         "stdout_log": stdout_log,
@@ -4208,6 +4651,71 @@ class ShinkaEvolveRunner:
                 ),
             )
 
+            # === ALG2 MOD (aux-selection): credit the arm that chose this parent. ===
+            # Reward = the child's quality RELATIVE TO THE CURRENT FRONTIER,
+            #     reward = O(child) / best_valid_so_far      (0 if the child is invalid)
+            #
+            # NOT O(child) - O(parent). That parent-relative form was measured to be badly
+            # biased by regression to the mean: an LLM mutation's quality is largely
+            # independent of its parent's score, so picking a STRONG parent almost always
+            # scores negative and picking a WEAK parent scores positive. In run v1 the
+            # main arm averaged parent 1.06 -> child 0.62 (imp -0.41) while the caging arm
+            # averaged parent 0.48 -> child 0.50 (imp +0.19). The bandit faithfully
+            # maximised that signal, drove beta to its floor, spent the budget mutating
+            # mediocre programs, and the frontier stalled (2.17 vs 2.43 for the control).
+            #
+            # The frontier-relative ratio has no parent-dependence: it asks "how good are
+            # the children this arm's parents actually produce?", is dense (every valid
+            # child gives signal, unlike a sparse new-best-only reward) and is bounded in
+            # roughly [0, 1.2], with >1 exactly when the child advances the frontier.
+            if self.aux_selection is not None:
+                try:
+                    arm = job.selection_arm or "main"
+                    # Reward baseline is the best valid score IN THE CHILD'S ISLAND, not
+                    # the global frontier. The aux arms deliberately pick lower-scoring
+                    # (structurally-underrated) parents, so against a global frontier their
+                    # children always look bad; a per-island frontier credits progress in
+                    # the region the arm actually worked in. The child inherits its parent's
+                    # island, so we read the parent's island_idx.
+                    if not hasattr(self, "_alg2_island_best"):
+                        self._alg2_island_best = {}
+                    island = None
+                    if job.parent_id:
+                        parent_prog = await self.async_db.get_async(job.parent_id)
+                        if parent_prog is not None:
+                            island = getattr(parent_prog, "island_idx", None)
+                    best = float(self._alg2_island_best.get(island, 0.0))
+                    if best <= 0.0:
+                        # cold start for this island: treat this child as its frontier
+                        best = float(combined_score) if correct_val and combined_score else 1.0
+                    improvement = (float(combined_score) / best) if correct_val else 0.0
+                    if correct_val and float(combined_score) > float(
+                        self._alg2_island_best.get(island, 0.0)
+                    ):
+                        self._alg2_island_best[island] = float(combined_score)
+                    self.aux_selection.update(arm, improvement)
+                    self.aux_selection.snapshot(
+                        generation=job.generation, arm=arm, improvement=improvement
+                    )
+                    self.aux_selection.write_history(
+                        os.path.join(self.results_dir, "aux_bandit_history.jsonl")
+                    )
+                    logger.info(
+                        f"ALG2 arm={arm} imp={improvement:+.4f} "
+                        f"beta={self.aux_selection.beta:.3f}"
+                    )
+                    # DIAGNOSTIC: how divergent is each aux's parent distribution from
+                    # the oracle's, over the current archive? Cheap (pool <= archive_size),
+                    # read-only, and gated in its own try/except so it can NEVER perturb
+                    # evolution -- it only writes aux_divergence.jsonl for later analysis.
+                    self._log_aux_divergence(job.generation)
+                    # BOOTSTRAP: periodically retire the worst active aux and activate a
+                    # fresh pool member (bandit-q driven; no LLM). Gated + self-guarded.
+                    self._maybe_bootstrap_swap(job.generation)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"ALG2 aux-selection update skipped: {e}")
+            # === END ALG2 MOD (aux-selection) ===
+
             # Add to database with timeout protection
             logger.info(
                 f"💾 DB ADD: Adding program to database for {job.job_id} (gen {job.generation})..."
@@ -4233,6 +4741,13 @@ class ShinkaEvolveRunner:
                     logger.info(
                         f"✅ DB SUCCESS: Program {program.id} successfully added to database for {job.job_id} (gen {job.generation})"
                     )
+                    # === STEERING MOD: observe this evaluated child (guarded; never blocks). ===
+                    await self._steering_after_eval(
+                        program,
+                        error_msg=(results.get("correct", {}).get("error")
+                                   if results else "no results produced"),
+                    )
+                    # === END STEERING MOD ===
                 else:
                     existing_program = None
                     if hasattr(self.async_db, "get_program_by_source_job_id_async"):
