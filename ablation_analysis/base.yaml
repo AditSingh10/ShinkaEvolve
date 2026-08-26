@@ -1,0 +1,12 @@
+# Common settings for every condition. Family-policy parameters are CLI arguments.
+generation_model: "local/qwen32b@http://127.0.0.1:8000/v1"
+embedding_model: "local/qwen-embed@http://127.0.0.1:8001/v1"
+temperature: 0.7
+max_tokens: 8192
+max_patch_resamples: 1
+max_patch_attempts: 1
+max_novelty_attempts: 1
+novelty_rejection: false
+validity_steering: false
+auxiliary_selection: false
+repair: false
