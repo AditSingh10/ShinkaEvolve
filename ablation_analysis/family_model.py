@@ -16,8 +16,13 @@ import numpy as np
 from representation import family_label
 
 
-CONDITIONS = ("baseline", "observe", "warmup", "parent", "inspiration", "prompt", "full")
-WARMUP_CONDITIONS = frozenset(("warmup", "parent", "inspiration", "prompt", "full"))
+CONDITIONS = (
+    "baseline", "observe", "warmup", "parent", "inspiration", "prompt", "full",
+    "warmup_validity",
+)
+WARMUP_CONDITIONS = frozenset(
+    ("warmup", "parent", "inspiration", "prompt", "full", "warmup_validity")
+)
 ONLINE_CONDITIONS = frozenset(("observe", "parent", "inspiration", "prompt", "full"))
 FAMILY_CONDITIONS = frozenset(("observe", "warmup", "parent", "inspiration", "prompt", "full"))
 PARENT_CONDITIONS = frozenset(("parent", "full"))
@@ -208,7 +213,7 @@ def cosine_diagnostics(index: FamilyIndex) -> Dict[str, Optional[float]]:
 
 
 class EventWriter:
-    FIELDS = (
+    CORE_FIELDS = (
         "proposal_id", "replicate", "seed", "condition", "phase", "t", "wall_clock_sec",
         "parent_program_id", "donor_program_id", "parent_family", "donor_family",
         "cross_family_donor", "K", "H_search", "H_population", "H_raw", "N_eff",
@@ -217,17 +222,24 @@ class EventWriter:
         "generation_seed", "generation_time_sec", "evaluation_time_sec",
         "summarization_time_sec", "embedding_time_sec",
     )
+    VALIDITY_FIELDS = (
+        "failure_classes", "validity_active", "active_constraint",
+        "validity_prompt_injected", "r_by_constraint", "lambda_by_constraint",
+        "controller_check", "trigger_on_event", "trigger_off_event",
+        "representative_witnesses",
+    )
+    FIELDS = CORE_FIELDS + VALIDITY_FIELDS
 
     def __init__(self, path: Path):
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
     def write(self, record: Dict[str, Any]) -> None:
-        missing = set(self.FIELDS) - set(record)
+        missing = set(self.CORE_FIELDS) - set(record)
         if missing:
             raise ValueError(f"event missing fields: {sorted(missing)}")
         with self.path.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps({k: record[k] for k in self.FIELDS}) + "\n")
+            stream.write(json.dumps({k: record.get(k) for k in self.FIELDS}) + "\n")
 
 
 def write_json(path: Path, payload: Any) -> None:

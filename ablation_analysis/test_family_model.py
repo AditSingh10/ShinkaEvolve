@@ -3,6 +3,8 @@ import math
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 
@@ -13,6 +15,7 @@ from family_model import (
 )
 from representation import (SUMMARY_FIELDS, build_warmup_context, parse_summary,
     serialize_summary)
+from run_evo import Experiment, Program, weighted_program_from_pool
 
 
 def detailed_summary(**overrides):
@@ -33,15 +36,49 @@ def detailed_summary(**overrides):
     return serialize_summary(values)
 
 
+class CapturingRng:
+    def __init__(self, result=0):
+        self.result = result
+        self.probabilities = None
+
+    def choice(self, size, p):
+        self.probabilities = np.asarray(p, dtype=float)
+        return self.result
+
+
+def sampling_experiment(condition="full"):
+    experiment = Experiment.__new__(Experiment)
+    experiment.args = SimpleNamespace(condition=condition, seed=104729)
+    experiment.family = FamilyIndex(0.8)
+    programs = (
+        (Program("A0", "", 1.0, children=0), [1.0, 0.0]),
+        (Program("A1", "", 2.0, children=1), [1.0, 0.0]),
+        (Program("A2", "", 4.0, children=3), [1.0, 0.0]),
+        (Program("B0", "", 0.5, children=2), [0.0, 1.0]),
+        (Program("B1", "", 3.0, children=0), [0.0, 1.0]),
+        (Program("B2", "", 5.0, children=1), [0.0, 1.0]),
+    )
+    experiment.programs = {program.id: program for program, _ in programs}
+    for program, embedding in programs:
+        assignment = experiment.family.assign(
+            program.id, program.score, f"summary {program.id}", embedding
+        )
+        program.family = assignment["family"]
+    return experiment
+
+
 class FamilyModelTests(unittest.TestCase):
-    def test_exact_seven_condition_factorization(self):
+    def test_condition_factorization_keeps_warmup_validity_prompt_only(self):
         self.assertEqual(CONDITIONS, (
-            "baseline", "observe", "warmup", "parent", "inspiration", "prompt", "full"))
-        self.assertEqual(WARMUP_CONDITIONS, {"warmup", "parent", "inspiration", "prompt", "full"})
+            "baseline", "observe", "warmup", "parent", "inspiration", "prompt", "full",
+            "warmup_validity"))
+        self.assertEqual(WARMUP_CONDITIONS, {
+            "warmup", "parent", "inspiration", "prompt", "full", "warmup_validity"})
         self.assertEqual(ONLINE_CONDITIONS, {"observe", "parent", "inspiration", "prompt", "full"})
         self.assertEqual(PARENT_CONDITIONS, {"parent", "full"})
         self.assertEqual(DONOR_CONDITIONS, {"inspiration", "full"})
         self.assertEqual(PROMPT_CONDITIONS, {"prompt", "full"})
+        self.assertNotIn("warmup_validity", PARENT_CONDITIONS | DONOR_CONDITIONS | PROMPT_CONDITIONS)
 
     def test_role_seeds_are_stable_and_separated(self):
         self.assertEqual(role_seed(7, 11, "parent_sampling"), role_seed(7, 11, "parent_sampling"))
@@ -78,6 +115,7 @@ class FamilyModelTests(unittest.TestCase):
         np.testing.assert_allclose(index.probabilities(0), [0.5, 0.5])
         expected = np.exp([3, 2]) / np.exp([3, 2]).sum()
         np.testing.assert_allclose(index.probabilities(1), expected)
+        np.testing.assert_allclose(index.probabilities(0.25), 0.75 / 2 + 0.25 * expected)
 
     def test_human_labels_are_one_based_and_seed_is_not_a_child_birth(self):
         index = FamilyIndex(0.8)
@@ -101,6 +139,96 @@ class FamilyModelTests(unittest.TestCase):
             self.assertIsNone(got["parent_family"])
             with self.assertRaises(ValueError):
                 writer.write({"proposal_id": 2})
+
+
+class ProgramSamplingTests(unittest.TestCase):
+    def test_member_probabilities_match_family_local_score_and_children_formula(self):
+        experiment = sampling_experiment()
+        rng = CapturingRng()
+        experiment.member_program(0, rng)
+
+        scores = np.asarray([1.0, 2.0, 4.0])
+        median = np.median(scores)
+        mad = max(float(np.median(np.abs(scores - median))), 1e-6)
+        sigmoid = 1.0 / (1.0 + np.exp(-10.0 * (scores - median) / mad))
+        expected = sigmoid / np.asarray([1.0, 2.0, 4.0])
+        expected /= expected.sum()
+        np.testing.assert_allclose(rng.probabilities, expected)
+
+    def test_higher_score_has_greater_probability_all_else_equal(self):
+        pool = [Program(str(i), "", score) for i, score in enumerate((1.0, 2.0, 3.0))]
+        rng = CapturingRng()
+        weighted_program_from_pool(pool, rng)
+        self.assertGreater(rng.probabilities[1], rng.probabilities[0])
+        self.assertGreater(rng.probabilities[2], rng.probabilities[1])
+
+    def test_more_children_lowers_probability_all_else_equal(self):
+        pool = (
+            Program("unused", "", 2.0, children=0),
+            Program("used", "", 2.0, children=3),
+        )
+        rng = CapturingRng()
+        weighted_program_from_pool(pool, rng)
+        np.testing.assert_allclose(rng.probabilities, [0.8, 0.2])
+
+    def test_equal_scores_produce_finite_normalized_probabilities(self):
+        pool = [Program(str(i), "", 7.0, children=i) for i in range(4)]
+        rng = CapturingRng()
+        weighted_program_from_pool(pool, rng)
+        self.assertTrue(np.all(np.isfinite(rng.probabilities)))
+        self.assertAlmostEqual(float(rng.probabilities.sum()), 1.0)
+
+    def test_member_program_never_samples_outside_selected_family(self):
+        experiment = sampling_experiment()
+        family_ids = set(experiment.family.member_ids(0))
+        for seed in range(100):
+            selected = experiment.member_program(0, np.random.RandomState(seed))
+            self.assertIn(selected.id, family_ids)
+
+    def test_parent_and_donor_both_use_shared_family_pool_weighting(self):
+        experiment = sampling_experiment()
+        pools = []
+
+        def choose_first(pool, rng):
+            pool = list(pool)
+            pools.append([program.id for program in pool])
+            return pool[0]
+
+        with patch.object(experiment.family, "sample_family", return_value=0), patch(
+            "run_evo.weighted_program_from_pool", side_effect=choose_first
+        ):
+            parent, donor = experiment.select(1, "normal", 0.5)
+
+        self.assertEqual(parent.id, "A0")
+        self.assertEqual(donor.id, "A1")
+        self.assertEqual(pools, [["A0", "A1", "A2"], ["A1", "A2"]])
+
+    def test_donor_exclusion_is_respected_and_statistics_are_recomputed(self):
+        experiment = sampling_experiment()
+        rng = CapturingRng()
+        donor = experiment.member_program(0, rng, exclude="A1")
+
+        self.assertNotEqual(donor.id, "A1")
+        scores = np.asarray([1.0, 4.0])
+        median = np.median(scores)
+        mad = max(float(np.median(np.abs(scores - median))), 1e-6)
+        sigmoid = 1.0 / (1.0 + np.exp(-10.0 * (scores - median) / mad))
+        expected = sigmoid / np.asarray([1.0, 4.0])
+        expected /= expected.sum()
+        np.testing.assert_allclose(rng.probabilities, expected)
+
+    def test_seeded_selection_is_reproducible(self):
+        left = sampling_experiment()
+        right = sampling_experiment()
+        left_selections = [
+            tuple(program.id for program in left.select(i, "normal", i / 20))
+            for i in range(1, 21)
+        ]
+        right_selections = [
+            tuple(program.id for program in right.select(i, "normal", i / 20))
+            for i in range(1, 21)
+        ]
+        self.assertEqual(left_selections, right_selections)
 
 
 class RepresentationTests(unittest.TestCase):
