@@ -17,17 +17,31 @@ from representation import family_label
 
 
 CONDITIONS = (
-    "baseline", "observe", "warmup", "parent", "inspiration", "prompt", "full",
-    "warmup_validity",
+    "baseline", "observe", "warmup", "parent", "inspiration", "prompt",
+    "full_annealed", "full_create", "warmup_validity",
 )
 WARMUP_CONDITIONS = frozenset(
-    ("warmup", "parent", "inspiration", "prompt", "full", "warmup_validity")
+    ("warmup", "parent", "inspiration", "prompt", "full_annealed", "full_create",
+     "warmup_validity")
 )
-ONLINE_CONDITIONS = frozenset(("observe", "parent", "inspiration", "prompt", "full"))
-FAMILY_CONDITIONS = frozenset(("observe", "warmup", "parent", "inspiration", "prompt", "full"))
-PARENT_CONDITIONS = frozenset(("parent", "full"))
-DONOR_CONDITIONS = frozenset(("inspiration", "full"))
-PROMPT_CONDITIONS = frozenset(("prompt", "full"))
+ONLINE_CONDITIONS = frozenset(
+    ("observe", "parent", "inspiration", "prompt", "full_annealed", "full_create")
+)
+FAMILY_CONDITIONS = frozenset(
+    ("observe", "warmup", "parent", "inspiration", "prompt", "full_annealed",
+     "full_create")
+)
+PARENT_CONDITIONS = frozenset(("parent", "full_annealed", "full_create"))
+DONOR_CONDITIONS = frozenset(("inspiration", "full_annealed", "full_create"))
+PROMPT_CONDITIONS = frozenset(("prompt", "full_annealed", "full_create"))
+ANNEALED_CONDITIONS = frozenset(("full_annealed",))
+CREATE_CONDITIONS = frozenset(("full_create",))
+CREATE_ACTION = "CREATE"
+
+
+def budget_fraction(completed_proposals: int, proposal_budget: int) -> float:
+    """Return the shared search-progress definition t = b / B."""
+    return float(completed_proposals) / int(proposal_budget)
 
 
 def role_seed(replicate_seed: int, proposal_id: int, role: str) -> int:
@@ -85,12 +99,17 @@ class Family:
 
     @property
     def summary(self) -> str:
+        representative = self.representative()
+        return representative.summary if representative is not None else ""
+
+    def representative(self) -> Optional[Member]:
+        """Return the member nearest the current centroid."""
         if not self.members:
-            return ""
+            return None
         return min(
             self.members,
             key=lambda m: 1.0 - float(np.dot(m.embedding, self.centroid)),
-        ).summary
+        )
 
     def quality(self) -> float:
         return float(statistics.median(m.score for m in self.members))
@@ -141,20 +160,93 @@ class FamilyIndex:
     def population_entropy(self) -> float:
         return entropy_from_counts((len(f.members) for f in self.families), len(self.families))["H"]
 
-    def probabilities(self, t: float) -> np.ndarray:
-        """pi_f(t)=(1-t)/K + t*softmax(median objective)_f."""
+    def quality_softmax(self) -> np.ndarray:
+        """Softmax of median valid-member objective by family."""
+        if not self.families:
+            return np.array([])
+        quality = np.asarray([family.quality() for family in self.families], dtype=float)
+        centered = quality - quality.max()
+        weights = np.exp(centered)
+        return weights / weights.sum()
+
+    @staticmethod
+    def exactly_normalized(probabilities: Sequence[float]) -> np.ndarray:
+        """Normalize and remove final-component floating-point sum drift."""
+        normalized_probabilities = np.asarray(probabilities, dtype=float)
+        normalized_probabilities /= normalized_probabilities.sum()
+        if len(normalized_probabilities) > 1:
+            normalized_probabilities[-1] = (
+                1.0 - float(normalized_probabilities[:-1].sum())
+            )
+        return normalized_probabilities
+
+    def annealed_probabilities(self, t: float) -> np.ndarray:
+        """Original family-only annealing policy over K existing families."""
         K = len(self.families)
         if not K:
             return np.array([])
-        q = np.asarray([f.quality() for f in self.families], dtype=float)
-        z = q - q.max()
-        soft = np.exp(z) / np.exp(z).sum()
-        p = (1.0 - float(np.clip(t, 0, 1))) / K + float(np.clip(t, 0, 1)) * soft
-        return p / p.sum()
+        clipped_t = float(np.clip(t, 0.0, 1.0))
+        probabilities = (
+            (1.0 - clipped_t) / K
+            + clipped_t * self.quality_softmax()
+        )
+        return self.exactly_normalized(probabilities)
 
-    def sample_family(self, t: float, rng: np.random.RandomState) -> int:
-        p = self.probabilities(t)
-        return int(rng.choice(len(p), p=p))
+    def create_probabilities(self, t: float) -> np.ndarray:
+        """Return probabilities for existing families followed by CREATE.
+
+        For K existing families, each family receives
+        ``(1-t)/(K+1) + t*softmax(Q)_f`` and CREATE receives
+        ``(1-t)/(K+1)``. The final normalization is only a floating-point
+        safeguard for the analytically normalized distribution.
+        """
+        K = len(self.families)
+        if not K:
+            return np.asarray([1.0])
+        clipped_t = float(np.clip(t, 0.0, 1.0))
+        create_probability = (1.0 - clipped_t) / (K + 1)
+        existing = create_probability + clipped_t * self.quality_softmax()
+        probabilities = np.concatenate((existing, [create_probability]))
+        probabilities = self.exactly_normalized(probabilities)
+        if clipped_t == 1.0:
+            probabilities[-1] = 0.0
+            probabilities[:-1] = self.exactly_normalized(probabilities[:-1])
+        return probabilities
+
+    def create_donor_probabilities(self, t: float) -> np.ndarray:
+        """Condition the action distribution on selecting an existing family."""
+        if not self.families:
+            return np.array([])
+        actions = self.create_probabilities(t)
+        existing = actions[:-1]
+        return self.exactly_normalized(existing)
+
+    def sample_create_action(self, t: float, rng: np.random.RandomState):
+        """Sample an existing family id or the CREATE sentinel."""
+        probabilities = self.create_probabilities(t)
+        selected = int(rng.choice(len(probabilities), p=probabilities))
+        return CREATE_ACTION if selected == len(self.families) else selected
+
+    @staticmethod
+    def sample_existing_family(probabilities: np.ndarray, rng: np.random.RandomState) -> int:
+        if not len(probabilities):
+            raise ValueError("cannot sample a donor family without existing families")
+        return int(rng.choice(len(probabilities), p=probabilities))
+
+    def sample_annealed_family(self, t: float, rng: np.random.RandomState) -> int:
+        """Sample from the original K-family annealed distribution."""
+        return self.sample_existing_family(self.annealed_probabilities(t), rng)
+
+    def sample_uniform_family(self, rng: np.random.RandomState) -> int:
+        """Sample an existing family uniformly during family-seeding warmup."""
+        if not self.families:
+            raise ValueError("cannot sample a family without existing families")
+        probabilities = np.full(len(self.families), 1.0 / len(self.families))
+        return self.sample_existing_family(probabilities, rng)
+
+    def sample_create_donor_family(self, t: float, rng: np.random.RandomState) -> int:
+        """Sample a CREATE-policy donor from existing families only."""
+        return self.sample_existing_family(self.create_donor_probabilities(t), rng)
 
     def member_ids(self, family: int) -> List[str]:
         return [m.program_id for m in self.families[family].members]
@@ -176,12 +268,8 @@ class FamilyIndex:
                 "label": family_label(f.id),
                 "centroid": f.centroid.tolist(),
                 "quality_median": f.quality(),
-                "representative_summary": min(
-                    f.members, key=lambda m: 1.0 - float(np.dot(m.embedding, f.centroid))
-                ).summary,
-                "representative_program_id": min(
-                    f.members, key=lambda m: 1.0 - float(np.dot(m.embedding, f.centroid))
-                ).program_id,
+                "representative_summary": f.representative().summary,
+                "representative_program_id": f.representative().program_id,
                 "members": [m.program_id for m in f.members],
             }
             for f in self.families
@@ -215,6 +303,8 @@ def cosine_diagnostics(index: FamilyIndex) -> Dict[str, Optional[float]]:
 class EventWriter:
     CORE_FIELDS = (
         "proposal_id", "replicate", "seed", "condition", "phase", "t", "wall_clock_sec",
+        "search_action", "mutation_intent", "create_probability",
+        "selected_parent_family", "selected_donor_family",
         "parent_program_id", "donor_program_id", "parent_family", "donor_family",
         "cross_family_donor", "K", "H_search", "H_population", "H_raw", "N_eff",
         "top_family_search_mass", "child_valid", "child_score", "best_score_so_far",

@@ -1,11 +1,14 @@
 import copy
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 
 from family_model import FamilyIndex
-from run_evo import Experiment, Program
+from run_evo import Experiment, Program, SearchSelection
 from validity_model import ValidityConfig, ValidityController, classify_failure
 
 
@@ -152,6 +155,21 @@ class PromptOnlyIsolationTests(unittest.TestCase):
             program.family = assignment["family"]
         return experiment
 
+    @staticmethod
+    def selection(experiment, parent_id="P0", donor_id="P1"):
+        parent = experiment.programs[parent_id]
+        donor = experiment.programs[donor_id]
+        intent = "REFINE" if parent.family == donor.family else "COMPOSE"
+        return SearchSelection(
+            search_action=f"F{parent.family + 1}",
+            mutation_intent=intent,
+            create_probability=0.0,
+            parent=parent,
+            donor=donor,
+            parent_family=parent.family,
+            donor_family=donor.family,
+        )
+
     def test_validity_cannot_change_parent_or_donor_sampling(self):
         warmup = self.experiment("warmup")
         validity = ValidityController(controller_config())
@@ -159,21 +177,25 @@ class PromptOnlyIsolationTests(unittest.TestCase):
         validity.active = True
         combined = self.experiment("warmup_validity", validity)
         np.testing.assert_allclose(
-            warmup.family.probabilities(0.5), combined.family.probabilities(0.5)
+            warmup.family.create_probabilities(0.5),
+            combined.family.create_probabilities(0.5),
         )
         for phase in ("warmup", "normal"):
             for proposal_id in range(1, 31):
                 left = warmup.select(proposal_id, phase, proposal_id / 200)
                 right = combined.select(proposal_id, phase, proposal_id / 200)
-                self.assertEqual((left[0].id, left[1].id), (right[0].id, right[1].id))
+                self.assertEqual(
+                    (left.parent.id, left.donor.id),
+                    (right.parent.id, right.donor.id),
+                )
 
     def test_disabled_warmup_validity_reduces_to_warmup_prompt(self):
         warmup = self.experiment("warmup")
         disabled = self.experiment("warmup_validity", validity=None)
         for phase in ("warmup", "normal"):
             self.assertEqual(
-                warmup.prompt(warmup.programs["P0"], warmup.programs["P1"], phase),
-                disabled.prompt(disabled.programs["P0"], disabled.programs["P1"], phase),
+                warmup.prompt(self.selection(warmup), phase),
+                disabled.prompt(self.selection(disabled), phase),
             )
 
     def test_warmup_and_validity_blocks_coexist(self):
@@ -181,9 +203,31 @@ class PromptOnlyIsolationTests(unittest.TestCase):
         validity.update(FAILURE)
         validity.active = True
         experiment = self.experiment("warmup_validity", validity)
-        prompt = experiment.prompt(experiment.programs["P0"], experiment.programs["P1"], "warmup")
-        self.assertIn("FAMILY-SEEDING WARMUP", prompt)
-        self.assertIn("SEARCH STEERING: VALIDITY", prompt)
+        prompt_text = experiment.prompt(self.selection(experiment), "warmup")
+        self.assertIn("FAMILY-SEEDING WARMUP", prompt_text)
+        self.assertIn("SEARCH STEERING: VALIDITY", prompt_text)
+
+    def test_validity_controller_is_disabled_for_both_full_diversity_policies(self):
+        config = {
+            "generation_model": "unused",
+            "embedding_model": "unused",
+            "warmup_validity": {"enabled": True},
+        }
+        for condition in ("full_annealed", "full_create"):
+            with self.subTest(condition=condition), tempfile.TemporaryDirectory() as tmp, patch(
+                "run_evo.get_client_llm", return_value=(object(), "unused", None)
+            ), patch("run_evo.EmbeddingClient"):
+                args = SimpleNamespace(
+                    condition=condition,
+                    replicate=1,
+                    seed=104729,
+                    proposals=1,
+                    family_similarity_threshold=0.85,
+                    entropy_window=25,
+                    run_name=str(Path(tmp) / f"{condition}-no-validity"),
+                )
+                experiment = Experiment(args, config)
+            self.assertIsNone(experiment.validity)
 
     def test_smoke_trajectory_accounts_for_each_proposal_and_releases(self):
         controller = ValidityController(controller_config(

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Launch the single frozen full-condition run and export paper-ready raw data."""
+"""Launch the frozen full_annealed run and export paper-ready raw data."""
 from __future__ import annotations
 
 import argparse
@@ -17,7 +17,7 @@ from family_model import family_label, write_json
 from run_evo import Experiment, REPO, ROOT
 
 
-RUN_NAME = "run_full_B200_K3_W40_rep1_seed104729"
+RUN_NAME = "run_full_annealed_B200_K3_W40_rep1_seed104729"
 FROZEN_FILES = ("representation.py", "family_model.py", "run_evo.py", "base.yaml")
 
 
@@ -31,7 +31,7 @@ def file_sha256(path: Path) -> str:
 
 def fixed_args() -> argparse.Namespace:
     return argparse.Namespace(
-        condition="full",
+        condition="full_annealed",
         replicate=1,
         seed=104729,
         proposals=200,
@@ -135,7 +135,7 @@ def export_post_run(experiment: Experiment) -> None:
     run_summary = json.loads((run_dir / "run_summary.json").read_text())
     analysis = {
         "problem": "Circle Packing",
-        "condition": "full",
+        "condition": "full_annealed",
         "proposals": len(events),
         "warmup_proposals_used": run_summary["warmup_proposal_count"],
         "warmup_reached_K_min": any(
