@@ -10,3 +10,20 @@ novelty_rejection: false
 validity_steering: false
 auxiliary_selection: false
 repair: false
+
+# Used only by the warmup_validity condition. This controller can modify prompts only.
+warmup_validity:
+  enabled: true
+  validity_ema_alpha: 0.15
+  lambda_lr: 0.10
+  target_violation_rate: 0.15
+  lambda_on: 0.60
+  lambda_off: 0.25
+  violation_rate_on: 0.30
+  violation_rate_off: 0.15
+  num_failure_witnesses: 3
+  witness_buffer_size: 12
+  controller_warmup: 20
+  controller_check_interval: 5
+  trigger_confirmation_checks: 2
+  release_confirmation_checks: 2

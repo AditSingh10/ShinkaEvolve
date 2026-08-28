@@ -19,19 +19,27 @@ ROOT = Path(__file__).resolve().parent
 REPO = ROOT.parent
 sys.path.insert(0, str(REPO))
 
-from family_model import (CONDITIONS, DONOR_CONDITIONS, EventWriter, FamilyIndex,
-    ONLINE_CONDITIONS, PARENT_CONDITIONS, PROMPT_CONDITIONS, SearchMass,
-    WARMUP_CONDITIONS, cosine_diagnostics, role_seed, write_json)
+from family_model import (CONDITIONS, CREATE_ACTION, CREATE_CONDITIONS, DONOR_CONDITIONS,
+    EventWriter, FamilyIndex, ONLINE_CONDITIONS, PARENT_CONDITIONS, PROMPT_CONDITIONS,
+    SearchMass, WARMUP_CONDITIONS, budget_fraction, cosine_diagnostics, role_seed,
+    write_json)
 from representation import (SUMMARY_SYSTEM, build_warmup_context, family_label,
     serialize_summary)
 from shinka.edit.apply_full import apply_full_patch
 from shinka.embed import EmbeddingClient
 from shinka.llm.client import get_client_llm
+from validity_model import ValidityConfig, ValidityController, classify_failure
 
 TASK = """You are an expert mathematician and computational geometer. Improve the supplied Python
 algorithm for packing 26 non-overlapping circles inside a unit square, maximizing the sum of radii.
 Return exactly one complete Python code block. Preserve the EVOLVE-BLOCK markers and fixed
 run_packing interface. Use only packages already available to the supplied program."""
+CREATE_TASK = """You are an expert mathematician and computational geometer. Develop a complete
+Python algorithm for packing 26 non-overlapping circles inside a unit square, maximizing the sum
+of radii. Return exactly one complete Python code block. Preserve the EVOLVE-BLOCK markers and
+fixed run_packing interface. Use only packages already available to the supplied program."""
+
+
 @dataclass
 class Program:
     id: str
@@ -39,6 +47,41 @@ class Program:
     score: float
     family: Optional[int] = None
     children: int = 0
+
+
+@dataclass
+class SearchSelection:
+    search_action: Optional[str]
+    mutation_intent: Optional[str]
+    create_probability: Optional[float]
+    parent: Optional[Program]
+    donor: Optional[Program]
+    parent_family: Optional[int]
+    donor_family: Optional[int]
+
+
+def weighted_program_from_pool(pool, rng):
+    """Sample by pool-local robust quality and reproduction count."""
+    pool = list(pool)
+    if not pool:
+        raise ValueError("cannot sample from an empty program pool")
+
+    scores = np.asarray([program.score for program in pool], dtype=float)
+    median = float(np.median(scores))
+    mad = max(float(np.median(np.abs(scores - median))), 1e-6)
+    z = 10.0 * (scores - median) / mad
+
+    sigmoid = np.empty_like(z)
+    nonnegative = z >= 0
+    sigmoid[nonnegative] = 1.0 / (1.0 + np.exp(-z[nonnegative]))
+    exp_z = np.exp(z[~nonnegative])
+    sigmoid[~nonnegative] = exp_z / (1.0 + exp_z)
+
+    weights = sigmoid * np.asarray(
+        [1.0 / (1 + program.children) for program in pool], dtype=float
+    )
+    probabilities = weights / weights.sum()
+    return pool[int(rng.choice(len(pool), p=probabilities))]
 
 
 class Experiment:
@@ -63,6 +106,21 @@ class Experiment:
         self.warmup_reached_k = False
         self.warmup_valid_children = 0
         self.initial_program_seeded = False
+        self.valid_children = 0
+        self.invalid_children = 0
+        self.family_birth_proposals = []
+        self.validity_history = []
+        validity_config = ValidityConfig.from_mapping(cfg.get("warmup_validity"))
+        self.validity = (
+            ValidityController(validity_config)
+            if args.condition == "warmup_validity" and validity_config.enabled
+            else None
+        )
+        self.validity_prompt_count = 0
+        self.create_attempts = 0
+        self.create_valid = 0
+        self.create_new_family_successes = 0
+        self.last_evaluation = {"error": None, "timed_out": False}
         random.seed(args.seed)
         np.random.seed(args.seed)
         self.gen_client, self.gen_model, _ = get_client_llm(cfg["generation_model"])
@@ -73,6 +131,7 @@ class Experiment:
     def evaluate(self, path: Path, directory: Path) -> Tuple[bool, Optional[float], float]:
         results = directory / "evaluation"
         results.mkdir(parents=True, exist_ok=True)
+        self.last_evaluation = {"error": None, "timed_out": False}
         begin = time.monotonic()
         cmd = [sys.executable, str(ROOT / "evaluator_entry.py"),
                "--program_path", str(path), "--results_dir", str(results)]
@@ -81,14 +140,24 @@ class Experiment:
                 timeout=self.args.evaluator_timeout_sec, check=False)
             (directory / "evaluator.stdout").write_text(done.stdout, encoding="utf-8")
             (directory / "evaluator.stderr").write_text(done.stderr, encoding="utf-8")
+            fallback_error = (done.stderr or done.stdout or "").strip()[-1000:]
         except subprocess.TimeoutExpired as exc:
-            (directory / "evaluator.stderr").write_text(f"timeout: {exc}\n", encoding="utf-8")
+            fallback_error = f"timeout: {exc}"
+            (directory / "evaluator.stderr").write_text(fallback_error + "\n", encoding="utf-8")
+            self.last_evaluation = {"error": fallback_error, "timed_out": True}
         elapsed = time.monotonic() - begin
         try:
-            valid = json.loads((results / "correct.json").read_text())["correct"]
+            correctness = json.loads((results / "correct.json").read_text())
+            valid = correctness["correct"]
             score = json.loads((results / "metrics.json").read_text()).get("combined_score")
+            self.last_evaluation = {
+                "error": correctness.get("error"),
+                "timed_out": False,
+            }
             return bool(valid), float(score) if score is not None else None, elapsed
         except Exception:
+            if not self.last_evaluation.get("timed_out"):
+                self.last_evaluation = {"error": fallback_error, "timed_out": False}
             return False, None, elapsed
 
     def observe(self, program: Program, proposal_id: int):
@@ -113,59 +182,164 @@ class Experiment:
         pool = [p for p in self.programs.values() if p.id != exclude]
         if not pool:
             return self.programs[exclude] if exclude else next(iter(self.programs.values()))
-        scores = np.asarray([p.score for p in pool], dtype=float)
-        median = float(np.median(scores))
-        mad = max(float(np.median(np.abs(scores - median))), 1e-6)
-        z = 10.0 * (scores - median) / mad
-        sigmoid = np.where(z >= 0, 1.0 / (1.0 + np.exp(-z)), np.exp(z) / (1.0 + np.exp(z)))
-        weights = sigmoid * np.asarray([1.0 / (1 + p.children) for p in pool])
-        return pool[int(rng.choice(len(pool), p=weights / weights.sum()))]
+        return weighted_program_from_pool(pool, rng)
 
-    def member_program(self, family, rng, exclude=None):
-        ids = [x for x in self.family.member_ids(family) if x != exclude]
-        if not ids:
-            return self.baseline_program(rng, exclude)
-        pool = sorted((self.programs[x] for x in ids), key=lambda p: p.score, reverse=True)
-        weights = np.asarray([(i + 1) ** -1.0 for i in range(len(pool))])
-        return pool[int(rng.choice(len(pool), p=weights / weights.sum()))]
+    def member_program(self, family, rng):
+        ids = self.family.member_ids(family)
+        pool = [self.programs[program_id] for program_id in ids]
+        return weighted_program_from_pool(pool, rng)
 
     def select(self, proposal_id, phase, t):
         frng = np.random.RandomState(role_seed(self.args.seed, proposal_id, "family_sampling"))
         prng = np.random.RandomState(role_seed(self.args.seed, proposal_id, "parent_sampling"))
         drng = np.random.RandomState(role_seed(self.args.seed, proposal_id, "donor_sampling"))
-        if phase == "normal" and self.args.condition in PARENT_CONDITIONS and self.family.families:
-            parent = self.member_program(self.family.sample_family(t, frng), prng)
+        create_probability = None
+        if phase == "normal":
+            create_probability = 0.0
+
+        if phase == "warmup" and self.family.families:
+            parent_family = self.family.sample_uniform_family(frng)
+            parent = self.member_program(parent_family, prng)
+        elif (phase == "normal" and self.args.condition in CREATE_CONDITIONS
+                and self.family.families):
+            action_probabilities = self.family.create_probabilities(t)
+            create_probability = float(action_probabilities[-1])
+            action = self.family.sample_create_action(t, frng)
+            if action == CREATE_ACTION:
+                return SearchSelection(
+                    search_action=CREATE_ACTION,
+                    mutation_intent=CREATE_ACTION,
+                    create_probability=create_probability,
+                    parent=None,
+                    donor=None,
+                    parent_family=None,
+                    donor_family=None,
+                )
+            parent = self.member_program(action, prng)
+        elif (phase == "normal" and self.args.condition in PARENT_CONDITIONS
+                and self.family.families):
+            parent = self.member_program(
+                self.family.sample_annealed_family(t, frng), prng
+            )
         else:
             parent = self.baseline_program(prng)
-        if phase == "normal" and self.args.condition in DONOR_CONDITIONS and self.family.families:
-            donor = self.member_program(self.family.sample_family(t, drng), drng, parent.id)
+        if phase == "warmup" and self.family.families:
+            donor_family = self.family.sample_uniform_family(drng)
+            donor = self.member_program(donor_family, drng)
+        elif phase == "normal" and self.args.condition in DONOR_CONDITIONS and self.family.families:
+            if self.args.condition in CREATE_CONDITIONS:
+                donor_family = self.family.sample_create_donor_family(t, drng)
+            else:
+                donor_family = self.family.sample_annealed_family(t, drng)
+            donor = self.member_program(donor_family, drng)
         else:
             donor = self.baseline_program(drng, parent.id)
-        return parent, donor
+        parent_family, donor_family = parent.family, donor.family
+        mutation_intent = None
+        search_action = None
+        if phase == "normal" and parent_family is not None:
+            search_action = family_label(parent_family)
+            if donor_family is not None and self.args.condition in CREATE_CONDITIONS:
+                mutation_intent = (
+                    "REFINE" if parent_family == donor_family else "COMPOSE"
+                )
+        return SearchSelection(
+            search_action=search_action,
+            mutation_intent=mutation_intent,
+            create_probability=create_probability,
+            parent=parent,
+            donor=donor,
+            parent_family=parent_family,
+            donor_family=donor_family,
+        )
 
-    def prompt(self, parent, donor, phase):
+    def create_prompt(self) -> str:
+        family_context = "\n\n".join(
+            f"Family {family_label(family.id)}:\n{family.summary}"
+            for family in self.family.families
+        )
+        return (
+            "SEARCH INTENT: CREATE\n\n"
+            "CURRENT ALGORITHM FAMILIES\n\n"
+            f"{family_context}\n\n"
+            "Develop a new algorithmic approach that is meaningfully different from the "
+            "approaches already represented above.\n\n"
+            "Do not merely modify parameters, constants, thresholds, tolerances, solver "
+            "settings, or surface-level implementation details. Change the underlying "
+            "computational strategy.\n\n"
+            "Novel, hybrid, or task-specific mechanisms are allowed. Continue optimizing "
+            "the primary task objective.\n\n"
+            "Use the family summaries only to understand what has already been explored; "
+            "do not treat them as mechanisms that must be reused.\n\n"
+            "Generate one complete candidate now."
+        )
+
+    @staticmethod
+    def intent_prompt(mutation_intent: Optional[str]) -> str:
+        if mutation_intent == "REFINE":
+            return (
+                "SEARCH INTENT: REFINE\n"
+                "The parent and donor belong to the same algorithm family. Use the parent as "
+                "the main solution; the donor provides useful implementation choices or "
+                "mechanisms from another variation in that family. Preserve the effective core "
+                "strategy while making a meaningful algorithmic, implementation, or "
+                "optimization improvement. Avoid cosmetic edits. Change parameters, "
+                "coefficients, tolerances, or iteration counts only when they support a "
+                "substantive improvement."
+            )
+        if mutation_intent == "COMPOSE":
+            return (
+                "SEARCH INTENT: COMPOSE\n"
+                "The parent and donor belong to different algorithm families. Start from the "
+                "parent and identify complementary mechanisms from the donor. Combine, adapt, "
+                "or integrate useful mechanisms; do not copy the donor or replace the parent "
+                "wholesale. The child may remain in the parent family, move toward the donor "
+                "family, or form a new hybrid family. Do not explicitly optimize novelty. "
+                "Optimize the primary task objective and avoid superficial parameter-only "
+                "changes."
+            )
+        return ""
+
+    def prompt(self, selection: SearchSelection, phase: str):
+        if selection.search_action == CREATE_ACTION:
+            return self.create_prompt()
+        parent, donor = selection.parent, selection.donor
+        if parent is None or donor is None:
+            raise ValueError("non-CREATE generation requires a parent and donor")
         context = ""
         if phase == "warmup":
             context = build_warmup_context(self.family.families)
         elif self.args.condition in PROMPT_CONDITIONS:
-            context = (f"PARENT FAMILY {family_label(parent.family)}:\n"
+            intent = (
+                self.intent_prompt(selection.mutation_intent)
+                if self.args.condition in CREATE_CONDITIONS else ""
+            )
+            context = (f"{intent}\n\nPARENT FAMILY {family_label(parent.family)}:\n"
                 f"{self.family.summary(parent.family)}\n"
                 f"DONOR FAMILY {family_label(donor.family)}:\n"
                 f"{self.family.summary(donor.family)}\n"
                 "Use the family context to make a coherent algorithmic improvement.")
-        return (f"{context}\n\nPARENT (score={parent.score:.8f}):\n```python\n{parent.code}\n```\n"
+        prompt = (f"{context}\n\nPARENT (score={parent.score:.8f}):\n```python\n{parent.code}\n```\n"
             f"\nDONOR (score={donor.score:.8f}):\n```python\n{donor.code}\n```\n"
             "Generate one improved child now.")
+        if self.validity is not None:
+            prompt += self.validity.prompt_block(self.b, self.B)
+        return prompt
 
-    def generate(self, parent, donor, phase, directory, seed):
+    def generate(self, selection, phase, directory, seed):
         begin = time.monotonic()
+        create = selection.search_action == CREATE_ACTION
         response = self.gen_client.chat.completions.create(model=self.gen_model, seed=seed,
             temperature=self.cfg["temperature"], max_tokens=self.cfg["max_tokens"], n=1,
-            messages=[{"role": "system", "content": TASK},
-                      {"role": "user", "content": self.prompt(parent, donor, phase)}])
+            messages=[{"role": "system", "content": CREATE_TASK if create else TASK},
+                      {"role": "user", "content": self.prompt(selection, phase)}])
         raw = response.choices[0].message.content or ""
         (directory / "generation.txt").write_text(raw, encoding="utf-8")
-        code, applied, _, error, _, _ = apply_full_patch(raw, original_str=parent.code,
+        # CREATE has no semantic parent. The canonical initial program is used only as a
+        # neutral technical scaffold for the full-code patch extractor and is never shown
+        # in the CREATE prompt.
+        scaffold = self.create_scaffold_code if create else selection.parent.code
+        code, applied, _, error, _, _ = apply_full_patch(raw, original_str=scaffold,
             patch_dir=directory / "patch", language="python", verbose=False)
         if not applied:
             code = f"raise RuntimeError({('candidate patch failure: ' + str(error))!r})\n"
@@ -180,7 +354,7 @@ class Experiment:
             self.warmup_end_b = self.b
             self.warmup_end_sec = time.monotonic() - self.start
             self.warmup_reached_k = reached
-            if self.args.condition == "warmup":
+            if self.args.condition in ("warmup", "warmup_validity"):
                 self.family.freeze()
 
     def run(self):
@@ -191,6 +365,7 @@ class Experiment:
         if not valid or score is None:
             raise RuntimeError("canonical initial Circle Packing program is invalid")
         initial = Program("P0", initial_path.read_text(encoding="utf-8"), score)
+        self.create_scaffold_code = initial.code
         self.programs["P0"] = initial
         self.best, self.initial_score = initial, score
         if self.args.condition in WARMUP_CONDITIONS:
@@ -200,19 +375,32 @@ class Experiment:
         for proposal_id in range(1, self.B + 1):
             self.maybe_end_warmup()
             phase = "normal" if self.warmup_done else "warmup"
-            t = proposal_id / self.B
-            parent, donor = self.select(proposal_id, phase, t)
-            parent.children += 1
-            pf, df = parent.family, donor.family
+            t = budget_fraction(self.b, self.B)
+            selection = self.select(proposal_id, phase, t)
+            parent, donor = selection.parent, selection.donor
+            if parent is not None:
+                parent.children += 1
+            pf, df = selection.parent_family, selection.donor_family
             self.search_mass.add(pf)
             self.b += 1
+            if selection.search_action == CREATE_ACTION:
+                self.create_attempts += 1
             directory = self.run_dir / f"proposal_{proposal_id:04d}"
             directory.mkdir()
             generation_seed = role_seed(self.args.seed, proposal_id, "candidate_generation")
-            code, generation_time = self.generate(parent, donor, phase, directory, generation_seed)
+            validity_prompt_injected = bool(self.validity is not None and self.validity.active)
+            if validity_prompt_injected:
+                self.validity_prompt_count += 1
+            code, generation_time = self.generate(selection, phase, directory, generation_seed)
             child_path = directory / "main.py"
             child_path.write_text(code, encoding="utf-8")
             child_valid, child_score, evaluation_time = self.evaluate(child_path, directory)
+            if child_valid:
+                self.valid_children += 1
+                if selection.search_action == CREATE_ACTION:
+                    self.create_valid += 1
+            else:
+                self.invalid_children += 1
             assignment = {"family": None, "created": None, "nearest_similarity": None,
                           "assignment_margin": None}
             summary_time = embedding_time = 0.0
@@ -224,12 +412,45 @@ class Experiment:
                 if self.args.condition in ONLINE_CONDITIONS or phase == "warmup":
                     assignment, summary_time, embedding_time = self.observe(child, proposal_id)
                     if phase == "warmup": self.warmup_valid_children += 1
+                    if assignment["created"]:
+                        self.family_birth_proposals.append(proposal_id)
+                        if selection.search_action == CREATE_ACTION:
+                            self.create_new_family_successes += 1
+            failure = {}
+            controller_event = {"controller_check": False, "trigger_on_event": False,
+                                "trigger_off_event": False}
+            if self.validity is not None:
+                failure = classify_failure(
+                    child_valid,
+                    error_msg=self.last_evaluation.get("error"),
+                    timed_out=bool(self.last_evaluation.get("timed_out")),
+                )
+                self.validity.update(failure)
+                controller_event = self.validity.check(proposal_id)
+                self.validity_history.append({
+                    "proposal_id": proposal_id,
+                    "valid": bool(child_valid),
+                    "prompt_injected": validity_prompt_injected,
+                    "trigger_on_event": controller_event["trigger_on_event"],
+                    "trigger_off_event": controller_event["trigger_off_event"],
+                })
             self.maybe_end_warmup()
             K, ent = len(self.family.families), self.search_mass.metrics(len(self.family.families))
             self.events.write({"proposal_id": proposal_id, "replicate": self.args.replicate,
                 "seed": self.args.seed, "condition": self.args.condition, "phase": phase, "t": t,
-                "wall_clock_sec": time.monotonic()-self.start, "parent_program_id": parent.id,
-                "donor_program_id": donor.id, "parent_family": pf, "donor_family": df,
+                "wall_clock_sec": time.monotonic()-self.start,
+                "search_action": selection.search_action,
+                "mutation_intent": selection.mutation_intent,
+                "create_probability": selection.create_probability,
+                "selected_parent_family": (
+                    family_label(pf) if pf is not None else None
+                ),
+                "selected_donor_family": (
+                    family_label(df) if df is not None else None
+                ),
+                "parent_program_id": parent.id if parent is not None else None,
+                "donor_program_id": donor.id if donor is not None else None,
+                "parent_family": pf, "donor_family": df,
                 "cross_family_donor": (pf != df) if pf is not None and df is not None else None,
                 "K": K, "H_search": ent["H"], "H_population": self.family.population_entropy(),
                 "H_raw": ent["H_raw"], "N_eff": ent["N_eff"],
@@ -240,7 +461,33 @@ class Experiment:
                 "assignment_margin": assignment["assignment_margin"],
                 "generation_seed": generation_seed, "generation_time_sec": generation_time,
                 "evaluation_time_sec": evaluation_time, "summarization_time_sec": summary_time,
-                "embedding_time_sec": embedding_time})
+                "embedding_time_sec": embedding_time,
+                "failure_classes": list(failure),
+                "validity_active": self.validity.active if self.validity is not None else None,
+                "active_constraint": (
+                    self.validity.active_constraint()
+                    if self.validity is not None and self.validity.active else None
+                ),
+                "validity_prompt_injected": (
+                    validity_prompt_injected if self.validity is not None else None
+                ),
+                "r_by_constraint": dict(self.validity.r) if self.validity is not None else None,
+                "lambda_by_constraint": (
+                    dict(self.validity.lam) if self.validity is not None else None
+                ),
+                "controller_check": (
+                    controller_event["controller_check"] if self.validity is not None else None
+                ),
+                "trigger_on_event": (
+                    controller_event["trigger_on_event"] if self.validity is not None else None
+                ),
+                "trigger_off_event": (
+                    controller_event["trigger_off_event"] if self.validity is not None else None
+                ),
+                "representative_witnesses": (
+                    self.validity.top_witnesses()
+                    if self.validity is not None and self.validity.active else []
+                )})
 
         ent, margins = self.search_mass.metrics(len(self.family.families)), self.family.margins
         summary = {"condition": self.args.condition, "replicate": self.args.replicate,
@@ -251,6 +498,14 @@ class Experiment:
             "final_H_search": ent["H"], "final_N_eff": ent["N_eff"],
             "number_of_family_births": self.family.child_created_births(
                 self.initial_program_seeded),
+            "family_birth_proposal_ids": self.family_birth_proposals,
+            "create_attempts": self.create_attempts,
+            "create_valid": self.create_valid,
+            "create_new_family_successes": self.create_new_family_successes,
+            "create_success_rate": (
+                self.create_new_family_successes / self.create_attempts
+                if self.create_attempts else None
+            ),
             "warmup_proposal_count": self.warmup_end_b,
             "warmup_wall_clock_duration": self.warmup_end_sec,
             "warmup_reached_K_min_before_B_warm": self.warmup_reached_k and self.warmup_end_b < self.args.warmup_budget,
@@ -259,6 +514,60 @@ class Experiment:
             "median_assignment_margin": float(np.median(margins)) if margins else None,
             "fraction_assignment_margin_le_zero": float(np.mean(np.asarray(margins)<=0)) if margins else None,
             **cosine_diagnostics(self.family)}
+        if self.args.condition == "warmup_validity":
+            def window_metrics(records):
+                count = len(records)
+                valid_count = sum(item["valid"] for item in records)
+                return {
+                    "proposals": count,
+                    "valid": valid_count,
+                    "invalid": count - valid_count,
+                    "validity_rate": valid_count / count if count else None,
+                    "enough_samples_for_interpretation": count >= 10,
+                }
+
+            episodes = [dict(episode) for episode in (self.validity.episodes if self.validity else [])]
+            first_prompt = min(
+                (episode["first_prompt_proposal"] for episode in episodes), default=None
+            )
+            releases = [
+                episode["end_proposal"] for episode in episodes
+                if episode["end_proposal"] is not None
+            ]
+            before = [
+                item for item in self.validity_history
+                if first_prompt is None or item["proposal_id"] < first_prompt
+            ]
+            during = [item for item in self.validity_history if item["prompt_injected"]]
+            after_release = [
+                item for item in self.validity_history
+                if releases and item["proposal_id"] > min(releases)
+                and not item["prompt_injected"]
+            ]
+            summary.update({
+                "proposal_budget": self.B,
+                "valid_proposals": self.valid_children,
+                "invalid_proposals": self.invalid_children,
+                "validity_rate": self.valid_children / self.B,
+                "validity": {
+                    "enabled": self.validity is not None,
+                    "failure_count_by_class": {
+                        key: int(self.validity.failure_counts[key])
+                        for key in self.validity.classes
+                    } if self.validity else {},
+                    "activation_episode_count": len(episodes),
+                    "activation_episodes": episodes,
+                    "validity_prompt_injection_fraction": self.validity_prompt_count / self.B,
+                    "final_r_by_constraint": dict(self.validity.r) if self.validity else {},
+                    "final_lambda_by_constraint": dict(self.validity.lam) if self.validity else {},
+                    "maximum_lambda_by_constraint": (
+                        dict(self.validity.max_lam) if self.validity else {}
+                    ),
+                    "validity_before_first_steering_activation": window_metrics(before),
+                    "validity_during_steering": window_metrics(during),
+                    "validity_after_steering_release": window_metrics(after_release),
+                },
+            })
         exported_families = self.family.export()
         summary["family_representatives"] = [
             {"family": f["id"], "family_label": family_label(f["id"]),
@@ -276,11 +585,12 @@ def main():
     p.add_argument("--replicate", type=int, required=True)
     p.add_argument("--seed", type=int, required=True)
     p.add_argument("--proposals", type=int, default=200)
-    p.add_argument("--k-min", type=int, default=5)
+    p.add_argument("--k-min", type=int, default=3)
     p.add_argument("--warmup-budget", type=int, default=40)
     p.add_argument("--entropy-window", type=int, default=25)
     p.add_argument("--family-similarity-threshold", type=float, default=0.85)
     p.add_argument("--evaluator-timeout-sec", type=int, default=300)
+    p.add_argument("--run-name")
     args = p.parse_args()
     with (ROOT / "base.yaml").open(encoding="utf-8") as stream: cfg = yaml.safe_load(stream)
     Experiment(args, cfg).run()

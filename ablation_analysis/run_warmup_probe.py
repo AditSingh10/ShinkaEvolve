@@ -11,7 +11,7 @@ from pathlib import Path
 import numpy as np
 import yaml
 
-from family_model import cosine_diagnostics, family_label, role_seed, write_json
+from family_model import budget_fraction, cosine_diagnostics, family_label, role_seed, write_json
 from representation import differing_major_dimensions, parse_summary
 from run_evo import Experiment, Program, REPO, ROOT
 
@@ -55,8 +55,9 @@ def run_probe(args) -> Path:
     birth_proposals = {}
 
     for proposal_id in range(1, args.warmup_budget + 1):
-        t = proposal_id / args.warmup_budget
-        parent, donor = experiment.select(proposal_id, "warmup", t)
+        t = budget_fraction(experiment.b, experiment.B)
+        selection = experiment.select(proposal_id, "warmup", t)
+        parent, donor = selection.parent, selection.donor
         parent.children += 1
         parent_family, donor_family = parent.family, donor.family
         experiment.search_mass.add(parent_family)
@@ -65,9 +66,7 @@ def run_probe(args) -> Path:
         directory = experiment.run_dir / f"proposal_{proposal_id:04d}"
         directory.mkdir()
         generation_seed = role_seed(args.seed, proposal_id, "candidate_generation")
-        code, generation_time = experiment.generate(
-            parent, donor, "warmup", directory, generation_seed
-        )
+        code, generation_time = experiment.generate(selection, "warmup", directory, generation_seed)
         code_hash = hashlib.sha256(code.encode()).hexdigest()
         all_hashes.append(code_hash)
         child_path = directory / "main.py"
@@ -113,6 +112,11 @@ def run_probe(args) -> Path:
             "phase": "warmup",
             "t": t,
             "wall_clock_sec": time.monotonic() - experiment.start,
+            "search_action": selection.search_action,
+            "mutation_intent": selection.mutation_intent,
+            "create_probability": selection.create_probability,
+            "selected_parent_family": None,
+            "selected_donor_family": None,
             "parent_program_id": parent.id,
             "donor_program_id": donor.id,
             "parent_family": parent_family,
@@ -214,12 +218,12 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=104729)
     parser.add_argument("--replicate", type=int, default=1)
     parser.add_argument("--k-min", type=int, default=3)
-    parser.add_argument("--warmup-budget", type=int, default=10)
+    parser.add_argument("--warmup-budget", type=int, default=40)
     parser.add_argument("--family-similarity-threshold", type=float, default=0.85)
     parser.add_argument("--entropy-window", type=int, default=5)
     parser.add_argument("--evaluator-timeout-sec", type=int, default=300)
     args = parser.parse_args()
-    args.condition = "full"
+    args.condition = "full_create"
     args.proposals = args.warmup_budget
     args.run_name = f"warmup_probe_seed{args.seed}"
     run_probe(args)

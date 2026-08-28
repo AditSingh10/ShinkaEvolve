@@ -15,7 +15,7 @@ PROPOSALS="${PROPOSALS:-200}"
 K_MIN="${K_MIN:-5}"
 WARMUP_BUDGET="${WARMUP_BUDGET:-40}"
 ENTROPY_WINDOW="${ENTROPY_WINDOW:-25}"
-CONDITIONS=(baseline observe warmup parent inspiration prompt full)
+CONDITIONS=(baseline observe warmup parent inspiration prompt full_annealed full_create)
 # Paired replicate seeds: every condition receives the same seed for a replicate.
 SEEDS=(${SEEDS:-104729 130363 155921 181081 206369})
 
