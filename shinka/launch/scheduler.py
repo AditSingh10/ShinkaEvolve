@@ -1,19 +1,23 @@
-import logging
-import time
 import asyncio
+import logging
 import shlex
 import sys
-from dataclasses import dataclass, asdict, field
-from typing import Optional, Dict, Any, Tuple, Union, List
+import time
 from concurrent.futures import ThreadPoolExecutor
-from .local import submit as submit_local, monitor as monitor_local
-from .local import ProcessWithLogging
-from .slurm import (
-    submit_docker as submit_slurm_docker,
-    submit_conda as submit_slurm_conda,
-    monitor as monitor_slurm,
-)
+from dataclasses import asdict, dataclass, field
+from typing import Any, Dict, List, Optional, Tuple, Union
+
 from shinka.utils import parse_time_to_seconds
+
+from .local import (
+    ProcessWithLogging,
+    terminate_process_tree,
+)
+from .local import monitor as monitor_local
+from .local import submit as submit_local
+from .slurm import monitor as monitor_slurm
+from .slurm import submit_conda as submit_slurm_conda
+from .slurm import submit_docker as submit_slurm_docker
 
 logger = logging.getLogger(__name__)
 
@@ -193,7 +197,9 @@ class JobScheduler:
                     *python_cmd,
                 ]
             if _has_value(self.config.activate_script):
-                activate_script = self.config.activate_script.strip().replace('"', '\\"')
+                activate_script = self.config.activate_script.strip().replace(
+                    '"', '\\"'
+                )
                 return [
                     "bash",
                     "-lc",
@@ -274,7 +280,7 @@ class JobScheduler:
         if isinstance(job_id, str):
             results = monitor_slurm(job_id, results_dir_t)
         else:
-            results = monitor_local(job_id, results_dir_t)
+            results = monitor_local(job_id, results_dir_t, timeout=self.config.time)
 
         end_time = time.time()
         rtime = end_time - start_time
@@ -356,7 +362,7 @@ class JobScheduler:
                                 f"timeout of {self.config.time}. Killing. "
                                 f"=> Gen. {job.generation}"
                             )
-                        job.job_id.kill()
+                        terminate_process_tree(job.job_id)
                         return False
 
                 # More robust status checking with exception handling
@@ -453,9 +459,9 @@ class JobScheduler:
                         )
                         return result.returncode == 0
                 else:
-                    # For local jobs, kill the process
+                    # For local jobs, terminate the full evaluator tree.
                     if isinstance(job_id, ProcessWithLogging):
-                        job_id.kill()
+                        terminate_process_tree(job_id)
                         return True
                 return False
             except Exception as e:

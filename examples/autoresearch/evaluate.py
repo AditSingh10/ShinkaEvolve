@@ -1,415 +1,323 @@
-"""Evaluator for the lightweight Autoresearch byte-prediction example."""
+"""Evaluate an external Autoresearch candidate checkout for ShinkaEvolve."""
 
 from __future__ import annotations
 
 import argparse
-import copy
-import importlib
+import hashlib
 import json
 import math
-import multiprocessing
 import os
-import sys
-from numbers import Real
+import signal
+import subprocess
+import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
+import adapter
+import psutil
 
-VOCAB_SIZE = 256
-NORMALIZATION_TOLERANCE = 1e-6
+MANIFEST_PATH = Path(__file__).with_name("upstream_manifest.json")
+_TERMINATION_GRACE_SECONDS = 1.0
+_RUNTIME_REPORTING_TOLERANCE_SECONDS = 0.5
 
 
-def _case(
-    instance_id: str,
-    training_bytes: bytes,
-    examples: list[tuple[bytes, int]],
-    seed: int,
-) -> tuple[dict[str, Any], bytes]:
-    """Build one public candidate input and its evaluator-only target bytes."""
-    contexts = [context for context, _ in examples]
-    targets = bytes(target for _, target in examples)
-    return (
-        {
-            "instance_id": instance_id,
-            "training_bytes": training_bytes,
-            "validation_contexts": contexts,
-            "vocab_size": VOCAB_SIZE,
-            "seed": seed,
-            "limits": {
-                "max_runtime_seconds": 1.0,
-                "max_context_bytes": 64,
-                "max_training_bytes": 20_000,
-            },
-        },
-        targets,
+def _write_artifact(path: Path, content: str) -> None:
+    """Atomically replace one result artifact with UTF-8 content."""
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=path.parent, delete=False
+    ) as temporary:
+        temporary.write(content)
+        temporary_path = Path(temporary.name)
+    os.replace(temporary_path, path)
+
+
+def _write_results(
+    results_dir: Path,
+    metrics: dict[str, Any],
+    correct: bool,
+    error: str,
+    stdout: str,
+    stderr: str,
+) -> None:
+    results_dir.mkdir(parents=True, exist_ok=True)
+    _write_artifact(results_dir / "candidate_stdout.log", stdout)
+    _write_artifact(results_dir / "candidate_stderr.log", stderr)
+    _write_artifact(
+        results_dir / "metrics.json",
+        json.dumps(metrics, indent=2, allow_nan=False) + "\n",
+    )
+    _write_artifact(
+        results_dir / "correct.json",
+        json.dumps({"correct": correct, "error": error}, indent=2, allow_nan=False)
+        + "\n",
     )
 
 
-def evaluation_cases() -> list[tuple[dict[str, Any], bytes]]:
-    """Return small deterministic cases while keeping targets out of candidate inputs."""
-    return [
-        _case(
-            "cyclic-pattern",
-            b"abcabcabcabc|bcabcabcabca|cabcabcabcab|" * 24,
-            [
-                (b"abcab", ord("c")),
-                (b"bcabc", ord("a")),
-                (b"cabcab", ord("c")),
-                (b"abcabc", ord("a")),
-            ],
-            104729,
-        ),
-        _case(
-            "field-grammar",
-            (b"name:alice;color:amber\nname:bob;color:blue\nname:carol;color:cyan\n")
-            * 18,
-            [
-                (b"record name:ali", ord("c")),
-                (b"record color:blu", ord("e")),
-                (b"record name:bo", ord("b")),
-                (b"record color:cya", ord("n")),
-            ],
-            130363,
-        ),
-        _case(
-            "local-language",
-            (
-                b"the small fox runs home. the small owl flies home. "
-                b"the bright fox sleeps well. the bright owl sees well. "
-            )
-            * 16,
-            [
-                (b"a small fox runs ho", ord("m")),
-                (b"a bright owl sees we", ord("l")),
-                (b"the small owl fl", ord("i")),
-                (b"the bright fox sle", ord("e")),
-            ],
-            155921,
-        ),
-    ]
-
-
-def _instance_data(instance: Any) -> tuple[int, int, float]:
-    if not isinstance(instance, dict):
-        raise ValueError("Instance must be a mapping.")
-    training_bytes = instance.get("training_bytes")
-    if not isinstance(training_bytes, bytes) or not training_bytes:
-        raise ValueError("training_bytes must be a nonempty bytes value.")
-    contexts = instance.get("validation_contexts")
-    if not isinstance(contexts, list) or not contexts:
-        raise ValueError("validation_contexts must be a nonempty list.")
-    if any(not isinstance(context, bytes) for context in contexts):
-        raise ValueError("Every validation context must be bytes.")
-    vocab_size = instance.get("vocab_size")
-    if vocab_size != VOCAB_SIZE or isinstance(vocab_size, bool):
-        raise ValueError(f"vocab_size must be exactly {VOCAB_SIZE}.")
-    seed = instance.get("seed")
-    if not isinstance(seed, int) or isinstance(seed, bool):
-        raise ValueError("seed must be an integer.")
-    limits = instance.get("limits")
-    if not isinstance(limits, dict):
-        raise ValueError("limits must be a mapping.")
-    runtime = limits.get("max_runtime_seconds")
-    max_context = limits.get("max_context_bytes")
-    max_training = limits.get("max_training_bytes")
-    if (
-        not isinstance(runtime, Real)
-        or isinstance(runtime, bool)
-        or not math.isfinite(float(runtime))
-        or runtime <= 0
+def _refresh_process_tree(root: psutil.Process, targets: set[psutil.Process]) -> None:
+    """Add currently observable descendants to a stable process set."""
+    targets.add(root)
+    try:
+        targets.update(root.children(recursive=True))
+    except (
+        psutil.AccessDenied,
+        psutil.NoSuchProcess,
+        psutil.ZombieProcess,
+        PermissionError,
     ):
-        raise ValueError("max_runtime_seconds must be positive and finite.")
-    if not isinstance(max_context, int) or isinstance(max_context, bool):
-        raise ValueError("max_context_bytes must be an integer.")
-    if not isinstance(max_training, int) or isinstance(max_training, bool):
-        raise ValueError("max_training_bytes must be an integer.")
-    if max_context <= 0 or any(len(context) > max_context for context in contexts):
-        raise ValueError("A validation context exceeds max_context_bytes.")
-    if max_training <= 0 or len(training_bytes) > max_training:
-        raise ValueError("training_bytes exceeds max_training_bytes.")
-    return len(contexts), vocab_size, float(runtime)
+        pass
 
 
-def _empty_stats() -> dict[str, Any]:
-    return {
-        "valid": False,
-        "prediction_shape": None,
-        "prediction_format": None,
-        "all_finite": False,
-        "max_normalization_error": None,
-        "mean_validation_loss": None,
-        "mean_validation_bits_per_byte": None,
-        "score": 0.0,
-    }
-
-
-def validate_predictions(
-    instance: Any, result: Any
-) -> tuple[bool, str, dict[str, Any], list[list[float]] | None]:
-    """Validate and normalize a candidate's probability distributions."""
-    stats = _empty_stats()
-
-    def invalid(message: str):
-        return False, message, stats, None
-
-    try:
-        prediction_count, vocab_size, _ = _instance_data(instance)
-    except ValueError as exc:
-        return invalid(f"Invalid evaluator instance: {exc}")
-    if not isinstance(result, dict):
-        return invalid("Result must be a mapping containing predictions.")
-    has_probabilities = "probabilities" in result
-    has_log_probabilities = "log_probabilities" in result
-    if has_probabilities == has_log_probabilities:
-        return invalid(
-            "Result must contain exactly one prediction field: probabilities or "
-            "log_probabilities."
-        )
-    prediction_format = "probabilities" if has_probabilities else "log_probabilities"
-    rows = result[prediction_format]
-    if not isinstance(rows, (list, tuple)):
-        return invalid("Predictions must be a list or tuple of distributions.")
-    if len(rows) != prediction_count:
-        return invalid(
-            f"Predictions must contain exactly {prediction_count} distributions."
-        )
-
-    probabilities: list[list[float]] = []
-    max_error = 0.0
-    for row_index, row in enumerate(rows):
-        if not isinstance(row, (list, tuple)):
-            return invalid(f"Prediction row {row_index} must be a list or tuple.")
-        if len(row) != vocab_size:
-            return invalid(
-                f"Prediction row {row_index} must contain exactly {vocab_size} values."
-            )
-        numeric_row = []
-        for value in row:
-            if not isinstance(value, Real) or isinstance(value, bool):
-                return invalid("Every prediction value must be a real finite number.")
-            numeric_value = float(value)
-            if not math.isfinite(numeric_value):
-                return invalid("Every prediction value must be finite.")
-            numeric_row.append(numeric_value)
-
-        if prediction_format == "probabilities":
-            if any(value < 0.0 for value in numeric_row):
-                return invalid("Every probability must be nonnegative.")
-            total = math.fsum(numeric_row)
-            error = abs(total - 1.0)
-            if error > NORMALIZATION_TOLERANCE:
-                return invalid("Every probability distribution must be normalized.")
-            normalized_row = numeric_row
-        else:
-            maximum = max(numeric_row)
-            log_sum_exp = maximum + math.log(
-                math.fsum(math.exp(value - maximum) for value in numeric_row)
-            )
-            error = abs(log_sum_exp)
-            if error > NORMALIZATION_TOLERANCE:
-                return invalid(
-                    "Every log-probability row must have log-sum-exp equal to zero."
-                )
-            normalized_row = [math.exp(value) for value in numeric_row]
-        max_error = max(max_error, error)
-        probabilities.append(normalized_row)
-
-    stats.update(
-        {
-            "valid": True,
-            "prediction_shape": [prediction_count, vocab_size],
-            "prediction_format": prediction_format,
-            "all_finite": True,
-            "max_normalization_error": max_error,
-        }
-    )
-    return True, "", stats, probabilities
-
-
-def score_predictions(
-    instance: Any, targets: bytes, result: Any
-) -> tuple[dict[str, Any], bool, str]:
-    """Compute loss and score from evaluator-owned target bytes."""
-    valid, error, stats, probabilities = validate_predictions(instance, result)
-    if not valid or probabilities is None:
-        return stats, False, error
-    if not isinstance(targets, bytes) or len(targets) != len(probabilities):
-        stats["valid"] = False
-        return stats, False, "Evaluator targets do not match prediction count."
-
-    target_probabilities = [
-        row[target] for row, target in zip(probabilities, targets, strict=True)
-    ]
-    if any(probability <= 0.0 for probability in target_probabilities):
-        stats["valid"] = False
-        return stats, False, "Validation loss is non-finite due to zero target mass."
-    losses = [-math.log(probability) for probability in target_probabilities]
-    mean_loss = math.fsum(losses) / len(losses)
-    bits_per_byte = mean_loss / math.log(2.0)
-    if not math.isfinite(mean_loss) or not math.isfinite(bits_per_byte):
-        stats["valid"] = False
-        return stats, False, "Validation loss must be finite."
-    stats.update(
-        {
-            "mean_validation_loss": mean_loss,
-            "mean_validation_bits_per_byte": bits_per_byte,
-            "score": 1.0 / (1.0 + bits_per_byte),
-        }
-    )
-    return stats, True, ""
-
-
-def _worker_target():
-    """Load the worker by an importable name so multiprocessing spawn can use it."""
-    example_directory = str(Path(__file__).resolve().parent)
-    if example_directory not in sys.path:
-        sys.path.insert(0, example_directory)
-    return importlib.import_module("autoresearch_worker").candidate_worker
-
-
-def _stop_process(process: multiprocessing.Process) -> None:
-    """Stop and reap a child, escalating when graceful termination is ignored."""
-    if not process.is_alive():
-        process.join()
-        return
-    process.terminate()
-    process.join(timeout=1.0)
-    if process.is_alive():
-        process.kill()
-        process.join(timeout=1.0)
-    if process.is_alive():
-        raise RuntimeError(f"Could not stop candidate process {process.pid}.")
-
-
-def _run_with_timeout(
-    program_path: str, instance: dict[str, Any], timeout: float
-) -> dict[str, Any]:
-    methods = multiprocessing.get_all_start_methods()
-    context = multiprocessing.get_context("fork" if "fork" in methods else "spawn")
-    parent_connection, child_connection = context.Pipe(duplex=False)
-    process = context.Process(
-        target=_worker_target(),
-        args=(program_path, copy.deepcopy(instance), child_connection),
-    )
-    process.start()
-    child_connection.close()
-    try:
-        if not parent_connection.poll(timeout):
-            _stop_process(process)
-            return {
-                "status": "timeout",
-                "error": f"Candidate exceeded time budget of {timeout:.3f} seconds.",
-                "runtime_seconds": timeout,
-            }
+def _signal_processes(
+    root: psutil.Process,
+    targets: set[psutil.Process],
+    method: str,
+    *,
+    include_root: bool,
+) -> None:
+    """Signal observed descendants before their root process."""
+    ordered_targets = [target for target in targets if target != root]
+    if include_root:
+        ordered_targets.append(root)
+    for target in ordered_targets:
         try:
-            payload = parent_connection.recv()
-        except EOFError:
-            payload = {
-                "status": "error",
-                "error": "Candidate process exited without returning predictions.",
-                "runtime_seconds": 0.0,
-            }
-        process.join(timeout=1.0)
-        if process.is_alive():
-            _stop_process(process)
-        return payload
-    finally:
-        parent_connection.close()
+            getattr(target, method)()
+        except (
+            psutil.AccessDenied,
+            psutil.NoSuchProcess,
+            psutil.ZombieProcess,
+            PermissionError,
+        ):
+            pass
 
 
-def _failure_metrics(error: str, num_instances: int, runtime: float) -> dict[str, Any]:
+def _signal_process_group(process_id: int, requested_signal: int) -> None:
+    """Signal the original POSIX group even if its leader has exited."""
+    try:
+        os.killpg(process_id, requested_signal)
+    except (PermissionError, ProcessLookupError):
+        pass
+
+
+def _stop_process_group(process: subprocess.Popen[str]) -> tuple[str, str]:
+    """Terminate and reap the candidate group and observed descendants."""
+    root: psutil.Process | None
+    targets: set[psutil.Process] = set()
+    try:
+        root = psutil.Process(process.pid)
+    except psutil.NoSuchProcess:
+        root = None
+
+    if root is not None:
+        _refresh_process_tree(root, targets)
+    if os.name == "posix":
+        _signal_process_group(process.pid, signal.SIGTERM)
+    if root is not None:
+        _signal_processes(
+            root,
+            targets,
+            "terminate",
+            include_root=os.name != "posix",
+        )
+    elif os.name != "posix":
+        process.terminate()
+
+    output: tuple[str, str] | None = None
+    try:
+        output = process.communicate(timeout=_TERMINATION_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        pass
+
+    if root is not None:
+        _refresh_process_tree(root, targets)
+    if os.name == "posix":
+        _signal_process_group(process.pid, signal.SIGKILL)
+    if root is not None:
+        _signal_processes(
+            root,
+            targets,
+            "kill",
+            include_root=os.name != "posix",
+        )
+        descendants = [target for target in targets if target != root]
+        _, alive = psutil.wait_procs(descendants, timeout=_TERMINATION_GRACE_SECONDS)
+        for target in alive:
+            try:
+                target.kill()
+            except (
+                psutil.AccessDenied,
+                psutil.NoSuchProcess,
+                psutil.ZombieProcess,
+                PermissionError,
+            ):
+                pass
+        if alive:
+            psutil.wait_procs(alive, timeout=_TERMINATION_GRACE_SECONDS)
+    elif os.name != "posix":
+        process.kill()
+    if output is None:
+        output = process.communicate()
+    return output
+
+
+def _run_candidate(
+    command: list[str], upstream_root: Path, environment: dict[str, str], timeout: float
+) -> tuple[str, str, float, str | None]:
+    """Run a candidate, decoding invalid UTF-8 as the replacement character."""
+    started_at = time.perf_counter()
+    process = subprocess.Popen(
+        command,
+        cwd=upstream_root,
+        env=environment,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=os.name == "posix",
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        stdout, stderr = _stop_process_group(process)
+        return stdout, stderr, time.perf_counter() - started_at, "Candidate timed out."
+
+    runtime_seconds = time.perf_counter() - started_at
+    if process.returncode != 0:
+        return (
+            stdout,
+            stderr,
+            runtime_seconds,
+            f"Candidate exited with status {process.returncode}.",
+        )
+    return stdout, stderr, runtime_seconds, None
+
+
+def _failure_metrics(
+    error: str,
+    runtime_seconds: float,
+    upstream_commit: str | None,
+    candidate_sha256: str | None,
+) -> dict[str, Any]:
     return {
         "combined_score": 0.0,
         "public": {
             "valid": False,
-            "num_instances": num_instances,
-            "num_valid_instances": 0,
-            "runtime_seconds": runtime,
+            "runtime_seconds": runtime_seconds,
+            "upstream_commit": upstream_commit,
+            "candidate_sha256": candidate_sha256,
+            "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
             "error": error,
         },
         "private": {},
     }
 
 
+def _candidate_sha256(program_path: str | os.PathLike[str]) -> str:
+    return hashlib.sha256(Path(program_path).read_bytes()).hexdigest()
+
+
 def evaluate_candidate(
-    program_path: str,
-    cases: list[tuple[dict[str, Any], bytes]] | None = None,
+    program_path: str | os.PathLike[str],
+    results_dir: str | os.PathLike[str],
+    upstream_root: str | os.PathLike[str],
+    timeout_seconds: float = 600.0,
+    *,
+    manifest_path: str | os.PathLike[str] = MANIFEST_PATH,
 ) -> tuple[dict[str, Any], bool, str]:
-    """Evaluate a candidate on isolated inputs and evaluator-owned targets."""
-    evaluation_data = evaluation_cases() if cases is None else cases
+    """Run a candidate against a pinned checkout and write Shinka artifacts."""
+    results_path = Path(results_dir)
+    stdout = ""
+    stderr = ""
     runtime_seconds = 0.0
+    upstream_commit: str | None = None
+    candidate_sha256: str | None = None
+    error = ""
+    correct = False
+
     try:
-        if not evaluation_data:
-            raise ValueError("No evaluation instances were provided.")
-        per_instance = []
-        for instance, targets in evaluation_data:
-            _, _, timeout = _instance_data(instance)
-            execution = _run_with_timeout(program_path, instance, timeout)
-            runtime_seconds += float(execution.get("runtime_seconds", 0.0))
-            if execution.get("status") != "ok":
-                raise RuntimeError(
-                    execution.get("error", "Candidate execution failed.")
-                )
-            if execution.get("mutated"):
-                raise ValueError("Candidate mutated the evaluator input instance.")
+        if not math.isfinite(timeout_seconds) or timeout_seconds <= 0.0:
+            raise ValueError("timeout_seconds must be positive and finite.")
+        adapter.require_single_cuda_device(os.environ)
+        candidate_sha256 = _candidate_sha256(program_path)
+        manifest = adapter.load_manifest(manifest_path)
+        expected_commit = manifest["commit"]
+        assert isinstance(expected_commit, str)
+        upstream_commit = expected_commit
+        upstream_path = Path(upstream_root).resolve()
+        adapter.validate_upstream(upstream_path, manifest)
+        before_snapshot = adapter.snapshot_protected_files(upstream_path, manifest)
 
-            instance_metrics, valid, error = score_predictions(
-                instance, targets, execution["result"]
+        try:
+            stdout, stderr, runtime_seconds, run_error = _run_candidate(
+                adapter.build_training_command(upstream_path, program_path),
+                upstream_path,
+                adapter.build_training_environment(upstream_path, os.environ),
+                timeout_seconds,
             )
-            instance_metrics["instance_id"] = instance.get("instance_id", "unknown")
-            instance_metrics["runtime_seconds"] = execution["runtime_seconds"]
-            if not valid:
-                raise ValueError(
-                    f"Instance {instance_metrics['instance_id']} is invalid: {error}"
+        finally:
+            try:
+                after_snapshot = adapter.snapshot_protected_files(
+                    upstream_path, manifest
                 )
-            per_instance.append(instance_metrics)
+                if after_snapshot != before_snapshot:
+                    raise adapter.AdapterError(
+                        "Protected upstream files changed during run."
+                    )
+            except adapter.AdapterError as snapshot_error:
+                run_error = str(snapshot_error)
 
-        num_instances = len(per_instance)
-        mean_loss = (
-            math.fsum(item["mean_validation_loss"] for item in per_instance)
-            / num_instances
-        )
-        mean_bits = (
-            math.fsum(item["mean_validation_bits_per_byte"] for item in per_instance)
-            / num_instances
-        )
+        if run_error is not None:
+            raise RuntimeError(run_error)
+        summary = adapter.parse_official_summary(stdout)
+        training_seconds = summary["training_seconds"]
+        assert isinstance(training_seconds, float)
+        if training_seconds > (runtime_seconds + _RUNTIME_REPORTING_TOLERANCE_SECONDS):
+            raise adapter.AdapterError(
+                "Reported training_seconds exceeds evaluator wall-clock runtime."
+            )
+        val_bpb = summary.pop("val_bpb")
+        assert isinstance(val_bpb, float)
         metrics = {
-            "combined_score": math.fsum(item["score"] for item in per_instance)
-            / num_instances,
+            "combined_score": adapter.score_from_bpb(val_bpb),
             "public": {
                 "valid": True,
-                "num_instances": num_instances,
-                "num_valid_instances": num_instances,
+                "val_bpb": val_bpb,
                 "runtime_seconds": runtime_seconds,
-                "mean_validation_loss": mean_loss,
-                "mean_validation_bits_per_byte": mean_bits,
-                "instances": per_instance,
+                **summary,
+                "upstream_commit": upstream_commit,
+                "candidate_sha256": candidate_sha256,
+                "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
             },
             "private": {},
         }
-        return metrics, True, ""
-    except Exception as exc:
-        error = f"{type(exc).__name__}: {exc}"
-        return (
-            _failure_metrics(error, len(evaluation_data), runtime_seconds),
-            False,
-            error,
+        correct = True
+    except (
+        adapter.AdapterError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ) as exception:
+        error = f"{type(exception).__name__}: {exception}"
+        metrics = _failure_metrics(
+            error, runtime_seconds, upstream_commit, candidate_sha256
         )
 
+    _write_results(results_path, metrics, correct, error, stdout, stderr)
+    return metrics, correct, error
 
-def main(program_path: str, results_dir: str) -> None:
-    """Evaluate a candidate and write ShinkaEvolve result artifacts."""
-    os.makedirs(results_dir, exist_ok=True)
-    metrics, correct, error = evaluate_candidate(program_path)
-    results_path = Path(results_dir)
-    (results_path / "metrics.json").write_text(
-        json.dumps(metrics, indent=4, allow_nan=False), encoding="utf-8"
-    )
-    (results_path / "correct.json").write_text(
-        json.dumps({"correct": correct, "error": error}, indent=4),
-        encoding="utf-8",
-    )
 
+def main(
+    program_path: str,
+    results_dir: str,
+    upstream_root: str,
+    timeout_seconds: float = 600.0,
+) -> None:
+    """Evaluate one external candidate and emit Shinka-compatible artifacts."""
+    metrics, correct, error = evaluate_candidate(
+        program_path, results_dir, upstream_root, timeout_seconds
+    )
     print(f"Evaluated program: {program_path}")
     print(f"Results saved to: {results_dir}")
     print(f"Correct: {correct}")
@@ -419,20 +327,15 @@ def main(program_path: str, results_dir: str) -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Evaluate a lightweight Autoresearch candidate"
+    parser = argparse.ArgumentParser(description="Evaluate an Autoresearch candidate")
+    parser.add_argument("--program_path", required=True)
+    parser.add_argument("--results_dir", required=True)
+    parser.add_argument("--upstream-root", required=True)
+    parser.add_argument("--timeout-seconds", type=float, default=600.0)
+    arguments = parser.parse_args()
+    main(
+        arguments.program_path,
+        arguments.results_dir,
+        arguments.upstream_root,
+        arguments.timeout_seconds,
     )
-    parser.add_argument(
-        "--program_path",
-        type=str,
-        default="initial.py",
-        help="Path to a candidate defining run_autoresearch(instance, seed)",
-    )
-    parser.add_argument(
-        "--results_dir",
-        type=str,
-        default="results",
-        help="Directory where metrics.json and correct.json are written",
-    )
-    args = parser.parse_args()
-    main(args.program_path, args.results_dir)

@@ -1,13 +1,17 @@
-import subprocess
-import time
-import threading
-import os
-from pathlib import Path
-from typing import Optional, Tuple, TextIO, Dict
-from shinka.utils import load_results, parse_time_to_seconds
 import logging
+import os
+import subprocess
+import threading
+import time
+from pathlib import Path
+from typing import Dict, Optional, TextIO, Tuple
+
+import psutil
+
+from shinka.utils import load_results, parse_time_to_seconds
 
 logger = logging.getLogger(__name__)
+_TERMINATION_GRACE_SECONDS = 1.0
 
 
 class ProcessWithLogging:
@@ -142,6 +146,69 @@ def submit(
     return wrapped_process
 
 
+def terminate_process_tree(process: ProcessWithLogging) -> None:
+    """Terminate, then kill and reap, a local process and observed descendants."""
+    try:
+        root = psutil.Process(process.pid)
+    except psutil.NoSuchProcess:
+        process.wait()
+        return
+
+    targets: set[psutil.Process] = {root}
+
+    def refresh_targets() -> None:
+        try:
+            targets.update(root.children(recursive=True))
+        except (
+            psutil.AccessDenied,
+            psutil.NoSuchProcess,
+            psutil.ZombieProcess,
+            PermissionError,
+        ):
+            pass
+
+    def signal_targets(method: str) -> None:
+        ordered_targets = [target for target in targets if target != root]
+        ordered_targets.append(root)
+        for target in ordered_targets:
+            try:
+                getattr(target, method)()
+            except (
+                psutil.AccessDenied,
+                psutil.NoSuchProcess,
+                psutil.ZombieProcess,
+                PermissionError,
+            ):
+                pass
+
+    refresh_targets()
+    signal_targets("terminate")
+    psutil.wait_procs(list(targets), timeout=_TERMINATION_GRACE_SECONDS)
+
+    # A SIGTERM handler can create a late child after the first snapshot.
+    refresh_targets()
+    signal_targets("kill")
+    _, alive = psutil.wait_procs(list(targets), timeout=_TERMINATION_GRACE_SECONDS)
+    if alive:
+        for target in alive:
+            try:
+                target.kill()
+            except (
+                psutil.AccessDenied,
+                psutil.NoSuchProcess,
+                psutil.ZombieProcess,
+                PermissionError,
+            ):
+                pass
+        psutil.wait_procs(alive, timeout=_TERMINATION_GRACE_SECONDS)
+
+    try:
+        process.wait(timeout=_TERMINATION_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+
+
 def monitor(
     process: ProcessWithLogging,
     results_dir: str,
@@ -174,7 +241,7 @@ def monitor(
                 logger.info(
                     f"Process {process.pid} exceeded timeout of {timeout}. Killing."
                 )
-            process.kill()
+            terminate_process_tree(process)
             break
 
         if verbose:
